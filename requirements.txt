@@ -3,3 +3,4 @@ uvicorn==0.30.6
 ccxt==4.4.13
 pydantic==2.8.2
 numpy==2.1.1
+mplfinance==0.12.9b7
