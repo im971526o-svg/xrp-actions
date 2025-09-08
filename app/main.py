@@ -285,3 +285,112 @@ def chart(
 @app.get("/")
 def root():
     return {"ok": True, "service": APP_NAME, "endpoints": ["/price", "/klines", "/indicators", "/chart"]}
+# ==== Experience logging (SQLite) ============================================
+import os, sqlite3
+from typing import Optional, Literal, List
+from pydantic import BaseModel
+from fastapi import Query
+
+EXPERIENCE_DB_PATH = os.getenv("EXPERIENCE_DB_PATH", "data/experience.db")
+
+def _init_experience_db():
+    os.makedirs(os.path.dirname(EXPERIENCE_DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(EXPERIENCE_DB_PATH, check_same_thread=False)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS experience (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      symbol TEXT NOT NULL,
+      interval TEXT NOT NULL,
+      pattern TEXT NOT NULL,
+      direction TEXT,
+      context TEXT,
+      entry REAL,     -- 4dp
+      confirm REAL,   -- 4dp
+      invalid REAL,   -- 4dp
+      exit REAL,      -- 4dp
+      result TEXT,    -- win/loss/breakeven/n/a
+      chart_url TEXT
+    );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_exp_ts ON experience(ts DESC);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_exp_pat ON experience(pattern);")
+    conn.commit()
+    conn.close()
+
+def _exp_conn():
+    conn = sqlite3.connect(EXPERIENCE_DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+@app.on_event("startup")
+def _exp_on_startup():
+    try:
+        _init_experience_db()
+    except Exception as e:
+        # 不影響主功能；失敗時只在 logs 告知
+        print("experience db init failed:", e)
+
+# ---- Pydantic models --------------------------------------------------------
+class ExperienceLogIn(BaseModel):
+    ts: Optional[int] = None           # ms；空值則用伺服器 now
+    symbol: str = "XRP/USDT"
+    interval: Literal["5m","15m","30m","1h","4h","1d"] = "15m"
+    pattern: str                       # 形態名稱（依你的《蠟燭圖精解》）
+    direction: Optional[Literal["long","short","neutral"]] = None
+    context: Optional[str] = None      # 摘要說明（依據、書中章節、KDJ/MACD/BB 提示等）
+    entry: Optional[float] = None      # 入場價（四位）
+    confirm: Optional[float] = None    # 確認價（四位）
+    invalid: Optional[float] = None    # 無效化價（四位）
+    exit: Optional[float] = None       # 出場/止損/止盈價（四位）
+    result: Optional[Literal["win","loss","breakeven","n/a"]] = None
+    chart_url: Optional[str] = None
+
+class ExperienceRow(ExperienceLogIn):
+    id: int
+
+# ---- Endpoints --------------------------------------------------------------
+@app.post("/experience/log")
+def experience_log(item: ExperienceLogIn):
+    # 四位小數統一
+    def _r4f(v): return None if v is None else float(f"{float(v):.4f}")
+    ts = item.ts or int(time.time()*1000)
+    conn = _exp_conn()
+    cur = conn.cursor()
+    cur.execute("""
+      INSERT INTO experience
+      (ts, symbol, interval, pattern, direction, context, entry, confirm, invalid, exit, result, chart_url)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        ts, item.symbol, item.interval, item.pattern, item.direction, item.context,
+        _r4f(item.entry), _r4f(item.confirm), _r4f(item.invalid), _r4f(item.exit),
+        item.result, item.chart_url
+    ))
+    conn.commit()
+    rid = cur.lastrowid
+    conn.close()
+    return {"ok": True, "id": rid}
+
+@app.get("/experience/recent")
+def experience_recent(
+    pattern: Optional[str] = None,
+    symbol: Optional[str] = None,
+    interval: Optional[Literal["5m","15m","30m","1h","4h","1d"]] = None,
+    limit: int = Query(50, ge=1, le=500)
+):
+    conn = _exp_conn()
+    q = "SELECT * FROM experience"
+    conds, args = [], []
+    if pattern:
+        conds.append("pattern = ?"); args.append(pattern)
+    if symbol:
+        conds.append("symbol = ?"); args.append(symbol)
+    if interval:
+        conds.append("interval = ?"); args.append(interval)
+    if conds:
+        q += " WHERE " + " AND ".join(conds)
+    q += " ORDER BY ts DESC LIMIT ?"; args.append(limit)
+    rows = [dict(r) for r in conn.execute(q, args).fetchall()]
+    conn.close()
+    return {"rows": rows, "count": len(rows)}
+# ==== end of experience logging =============================================
