@@ -1,0 +1,100 @@
+openapi: 3.1.0
+info:
+  title: XRP Pattern Scanner Actions
+  version: "1.0.0"
+servers:
+  - url: https://bdfe26015670.ngrok-free.app
+paths:
+  /scan:
+    get:
+      operationId: scan
+      summary: Scan XRP/USDT for candlestick patterns across intervals
+      parameters:
+        - name: symbol
+          in: query
+          required: false
+          schema:
+            type: string
+            default: XRP/USDT
+        - name: intervals
+          in: query
+          required: false
+          description: Comma-separated list among 15m,1h,4h,1d
+          schema:
+            type: string
+            default: 15m,1h,4h,1d
+        - name: lookback
+          in: query
+          required: false
+          description: Candles to fetch per interval (10..1000)
+          schema:
+            type: integer
+            default: 200
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScanResponse'
+  /explain:
+    get:
+      operationId: explain
+      summary: Explain a specific detection and return evidence window + rationale
+      parameters:
+        - name: pattern_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExplainResponse'
+components:
+  schemas:
+    Detection:
+      type: object
+      properties:
+        id: { type: string }
+        symbol: { type: string }
+        interval: { type: string, enum: [15m,1h,4h,1d] }
+        pattern_name: { type: string }
+        direction: { type: string, enum: [bullish, bearish, neutral] }
+        confidence: { type: number }
+        t_start: { type: integer }
+        t_end: { type: integer }
+        index_range:
+          type: array
+          items: { type: integer }
+        extra:
+          type: object
+    ScanResponse:
+      type: object
+      properties:
+        detections:
+          type: array
+          items:
+            $ref: '#/components/schemas/Detection'
+        meta:
+          type: object
+    ExplainResponse:
+      type: object
+      properties:
+        detection:
+          $ref: '#/components/schemas/Detection'
+        evidence:
+          type: object
+        rationale:
+          type: string
+        references:
+          type: array
+          items:
+            type: object
+            properties:
+              title: { type: string }
+              section: { type: string }
+              note: { type: string }
