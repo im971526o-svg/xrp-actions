@@ -90,23 +90,19 @@ def explain(pattern_id: str):
     ]
     return ExplainResponse(detection=det, evidence=evidence, rationale=rationale, references=references)
 # ===== Binance helpers & indicators （貼在檔案最底部）=====
+
 def _ex_binance():
-    # 啟用限流 + 補上 adjustForTimeDifference，避免 KeyError
+    # 啟用限流；顯式關閉 adjustForTimeDifference（避免某些 ccxt 版本報 KeyError）
     ex = ccxt.binance({
         "enableRateLimit": True,
         "options": {
             "defaultType": "spot",
-            "adjustForTimeDifference": True,  # ★ 關鍵修正
+            "adjustForTimeDifference": False,   # ★ 改成 False
         },
     })
-    # 保險：確保 options 一定有這個 key（即使 ccxt 版本差異）
+    # 雙保險：確保 options 有這個 key
     if "adjustForTimeDifference" not in ex.options:
-        ex.options["adjustForTimeDifference"] = True
-    # 可選：與交易所校時，避免因時間差導致簽名/節流出錯
-    try:
-        ex.load_time_difference()
-    except Exception:
-        pass
+        ex.options["adjustForTimeDifference"] = False
     return ex
 
 
