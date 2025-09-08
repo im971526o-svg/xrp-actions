@@ -1,6 +1,8 @@
-fastapi==0.115.2
-uvicorn==0.30.6
-ccxt==4.4.13
-pydantic==2.8.2
-numpy==2.1.1
-mplfinance==0.12.9b7
+fastapi
+uvicorn
+ccxt
+pandas
+numpy
+matplotlib
+mplfinance==0.12.9b7   # 若裝不上可改 0.12.10b0 或不鎖版
+pillow                 # 讓 matplotlib 能輸出 PNG
