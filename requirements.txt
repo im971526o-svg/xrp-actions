@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+ccxt
+pandas
+numpy
+matplotlib
+mplfinance
+pillow
+sqlalchemy
+psycopg2-binary
+pytz
+tzdata
