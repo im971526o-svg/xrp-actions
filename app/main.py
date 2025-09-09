@@ -1,382 +1,448 @@
 # app/main.py
-import os
-import io
-import time
-import math
-import json
-import sqlite3
-import threading
-from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+# ============================================================================
+# XRP Pattern Scanner Actions - single-file backend
+# Endpoints:
+#   GET  /                -> root OK
+#   GET  /price           -> 現價（含本地時間字串）
+#   GET  /klines          -> K 線資料 rows (ts/open/high/low/close/volume)
+#   GET  /indicators      -> 取得最新一根的技術指標（BBands/KDJ/MACD）
+#   GET  /chart           -> 穩定版 K 線圖（可含成交量＋指標）image/png|webp|jpeg
+#   GET  /chart/quick     -> 超簡版 K 線圖（預設參數）
+#   POST /experience/log  -> 寫入經驗（SQLite）
+#   GET  /experience/recent -> 讀取最近經驗
+# ============================================================================
 
-import numpy as np
+import io
+import math
+import time
+from datetime import datetime, timezone
+from typing import List, Optional
+
 import pandas as pd
+import numpy as np
 
 import matplotlib
-matplotlib.use("Agg")  # 無頭環境
+matplotlib.use("Agg")  # 關鍵：無頭環境使用 Agg 後端（Render 等雲端必備）
 import matplotlib.pyplot as plt
 
-from PIL import Image
+from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse, JSONResponse
-
+# 市場資料 (ccxt)
 import ccxt
 
-APP_NAME = os.getenv("APP_NAME", "XRP Pattern Scanner Actions")
-TZ_NAME = os.getenv("TZ_NAME", "Asia/Taipei")
-SYMBOL_DEFAULT = "XRP/USDT"
+# SQLite 永久儲存（經驗日誌）
+from sqlalchemy import Column, Integer, String, Text, DateTime, create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# ===== FastAPI =====
-app = FastAPI(title=APP_NAME)
+APP_NAME = "XRP Pattern Scanner Actions"
+app = FastAPI(title=APP_NAME, version="0.1.1")
 
-# ===== DB (SQLite 檔案，免費 Render 也能用；若要永久化，改用外部 Postgres) =====
-DB_PATH = os.getenv("SQLITE_PATH", "/tmp/xrp_actions.db")
+# CORS：預設開放（方便你在不同環境測）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=False,
+    allow_methods=["*"], allow_headers=["*"],
+)
 
-def db_init():
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS experience_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts INTEGER NOT NULL,
-        symbol TEXT NOT NULL,
-        interval TEXT NOT NULL,
-        pattern TEXT,
-        outcome TEXT,
-        notes TEXT
-    );
-    """)
-    conn.commit()
-    conn.close()
+# -----------------------------------------------------------------------------
+# Exchange 初始化（Binance）
+# -----------------------------------------------------------------------------
+exchange = ccxt.binance({"enableRateLimit": True})
+# 對時（你之前遇到過的 AdjustForTimeDifference 問題，這裡內建打開）
+try:
+    exchange.options["adjustForTimeDifference"] = True
+except Exception:
+    pass
 
-db_init()
+# -----------------------------------------------------------------------------
+# SQLite 初始化（經驗日誌）
+# -----------------------------------------------------------------------------
+Base = declarative_base()
+engine = create_engine("sqlite:///data.db", connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
 
-def db_insert(ts: int, symbol: str, interval: str, pattern: str, outcome: str, notes: str) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO experience_log (ts, symbol, interval, pattern, outcome, notes) VALUES (?, ?, ?, ?, ?, ?)",
-        (ts, symbol, interval, pattern, outcome, notes)
-    )
-    conn.commit()
-    conn.close()
+class Experience(Base):
+    __tablename__ = "experiences"
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(32), nullable=False)
+    interval = Column(String(8), nullable=False)
+    pattern = Column(String(64), nullable=False)   # e.g. hammer / three_white_soldiers ...
+    outcome = Column(String(16), nullable=False)   # bullish / bearish / neutral
+    notes = Column(Text, nullable=True)
+    ts = Column(DateTime(timezone=True), nullable=False)
 
-def db_recent(limit: int = 20) -> List[Dict[str, Any]]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT ts, symbol, interval, pattern, outcome, notes FROM experience_log ORDER BY id DESC LIMIT ?", (limit,))
-    rows = cur.fetchall()
-    conn.close()
-    res = []
-    for r in rows:
-        res.append({
-            "ts": r[0],
-            "symbol": r[1],
-            "interval": r[2],
-            "pattern": r[3],
-            "outcome": r[4],
-            "notes": r[5],
+Base.metadata.create_all(bind=engine)
+
+# -----------------------------------------------------------------------------
+# Helper / Utils
+# -----------------------------------------------------------------------------
+TF_ALLOW = {"5m", "15m", "30m", "1h", "4h", "1d"}
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def tz_taipei_now():
+    # 保持和後端時間設定一致
+    return datetime.now(timezone.utc).astimezone().astimezone()
+
+def to_taipei_ms(ms:int) -> datetime:
+    return datetime.fromtimestamp(ms/1000, tz=timezone.utc).astimezone()
+
+def zh_time(dt: datetime) -> str:
+    h = dt.hour
+    m = dt.minute
+    ap = "上午" if h < 12 else "下午"
+    h12 = h % 12
+    if h12 == 0:
+        h12 = 12
+    return f"{ap} {h12:02d} 點 {m:02d} 分"
+
+def fetch_ohlcv(symbol: str, interval: str, limit: int) -> List[dict]:
+    """
+    從 Binance 取得 OHLCV，輸出成 list[dict] 格式。
+    """
+    if interval not in TF_ALLOW:
+        raise HTTPException(400, f"interval must be one of {sorted(TF_ALLOW)}")
+    limit = clamp(limit, 50, 500)
+    try:
+        raw = exchange.fetch_ohlcv(symbol, timeframe=interval, limit=limit)
+    except Exception as e:
+        raise HTTPException(502, f"fetch_ohlcv error: {e}")
+
+    rows = []
+    for ts, o, h, l, c, v in raw:
+        rows.append({
+            "ts": int(ts),
+            "open": float(o), "high": float(h),
+            "low": float(l), "close": float(c),
+            "volume": float(v)
         })
-    return res
+    return rows
 
-# ===== Helper：時間、四捨五入、圖片壓縮 =====
-def local_str(ts_ms: int, tz_name: str = TZ_NAME) -> str:
-    # pandas 讓我們不加額外套件也能轉 tz
-    dt = pd.Timestamp(ts_ms, unit="ms", tz="UTC").tz_convert(tz_name)
-    hh = int(dt.strftime("%I"))  # 12 小時制，前導零去掉
-    mm = int(dt.strftime("%M"))
-    ap = "上午" if dt.strftime("%p") == "AM" else "下午"
-    return f"{ap} {hh} 點 {mm} 分"
+def fetch_price(symbol: str, source: str = "ticker") -> float:
+    """
+    取得現價：
+    - source=ticker : 使用 ticker 最後成交價
+    - source=book   : 使用最佳 bid/ask 取中間價
+    """
+    try:
+        if source == "book":
+            ob = exchange.fetch_order_book(symbol, limit=5)
+            best_bid = ob["bids"][0][0] if ob["bids"] else None
+            best_ask = ob["asks"][0][0] if ob["asks"] else None
+            if best_bid is None or best_ask is None:
+                raise Exception("empty orderbook")
+            return float((best_bid + best_ask) / 2)
+        else:
+            t = exchange.fetch_ticker(symbol)
+            # 有些交易所有 last / close
+            px = t.get("last") or t.get("close")
+            return float(px)
+    except Exception as e:
+        raise HTTPException(502, f"fetch_price error: {e}")
 
-def round4(x: float) -> float:
-    return float(f"{x:.4f}")
-
-def save_png_under(fig, target_kb: int = 150) -> bytes:
-    """將 Matplotlib figure 轉 PNG 並嘗試壓到 ~target_kb。"""
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.1)
-    data = buf.getvalue()
-    buf.close()
-
-    if len(data) <= target_kb * 1024:
-        return data
-
-    # 用 PIL 量化壓小
-    img = Image.open(io.BytesIO(data)).convert("RGB")
-    for colors in (128, 96, 64, 32):
-        out = io.BytesIO()
-        img_p = img.convert("P", palette=Image.ADAPTIVE, colors=colors)
-        img_p.save(out, format="PNG", optimize=True)
-        d = out.getvalue()
-        out.close()
-        if len(d) <= target_kb * 1024:
-            return d
-    return d  # 實在壓不下就回最後一次
-
-# ===== 交易所：Binance（ccxt）=====
-def binance():
-    ex = ccxt.binance({"enableRateLimit": True})
-    # 避免時間差錯誤
-    ex.options["adjustForTimeDifference"] = True
-    return ex
-
-# ===== 技術指標 =====
-def calc_bbands(close: pd.Series, n: int = 20, k: float = 2.0):
-    ma = close.rolling(n).mean()
-    std = close.rolling(n).std(ddof=0)
-    upper = ma + k * std
-    lower = ma - k * std
-    return ma, upper, lower
-
-def calc_kdj(df: pd.DataFrame, n: int = 9):
-    low_n = df["low"].rolling(n).min()
-    high_n = df["high"].rolling(n).max()
-    rsv = (df["close"] - low_n) / (high_n - low_n + 1e-9) * 100
-    k = rsv.ewm(alpha=1/3, adjust=False).mean()
-    d = k.ewm(alpha=1/3, adjust=False).mean()
-    j = 3 * k - 2 * d
-    return k, d, j
-
-def calc_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-    dif = ema_fast - ema_slow
-    dea = dif.ewm(span=signal, adjust=False).mean()
-    hist = dif - dea
-    return dif, dea, hist
-
-# ===== 取 K 線 =====
-def fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-    ex = binance()
-    ms = ex.parse_timeframe(interval) * 1000
-    now = int(time.time() * 1000)
-    since = now - ms * (limit + 5)
-    ohlcv = ex.fetch_ohlcv(symbol, timeframe=interval, since=since, limit=limit)
-    cols = ["ts", "open", "high", "low", "close", "volume"]
-    df = pd.DataFrame(ohlcv, columns=cols)
-    return df
-
-# ====== Endpoints ======
-@app.get("/")
+# -----------------------------------------------------------------------------
+# Root
+# -----------------------------------------------------------------------------
+@app.get("/", summary="Root")
 def root():
-    return {"ok": True}
+    return {"ok": True, "service": APP_NAME}
 
-@app.get("/price")
+# -----------------------------------------------------------------------------
+# /price
+# -----------------------------------------------------------------------------
+@app.get("/price", summary="現價")
 def get_price(
-    symbol: str = Query(SYMBOL_DEFAULT, example="XRP/USDT"),
-    precision: int = Query(4, ge=0, le=10),
+    symbol: str = Query(..., example="XRP/USDT"),
+    precision: int = Query(4, ge=0, le=10, description="小數位數"),
     source: str = Query("ticker", regex="^(ticker|book)$", description="ticker 或 book")
 ):
-    ex = binance()
-
-    if source == "book":
-        ob = ex.fetch_order_book(symbol)
-        if not ob["bids"] or not ob["asks"]:
-            raise HTTPException(503, "orderbook not ready")
-        price = (ob["bids"][0][0] + ob["asks"][0][0]) / 2
-    else:
-        t = ex.fetch_ticker(symbol)
-        price = t["last"] or t["close"] or t["bid"] or t["ask"]
-
-    price = float(f"{price:.{precision}f}")
+    px = fetch_price(symbol, source=source)
     ts = int(time.time() * 1000)
+    local = to_taipei_ms(ts)
     return {
         "exchange": "binance",
         "symbol": symbol,
-        "price": price,
+        "price": round(px, precision),
         "ts": ts,
-        "time_local": local_str(ts),
-        "precision": precision
+        "time_local": zh_time(local)
     }
 
-@app.get("/klines")
+# -----------------------------------------------------------------------------
+# /klines
+# -----------------------------------------------------------------------------
+@app.get("/klines", summary="K 線")
 def get_klines(
-    symbol: str = Query(SYMBOL_DEFAULT),
+    symbol: str = Query(..., example="XRP/USDT"),
     interval: str = Query("15m", regex="^(5m|15m|30m|1h|4h|1d)$"),
     limit: int = Query(200, ge=50, le=500)
 ):
-    df = fetch_klines(symbol, interval, limit)
-    rows = df.to_dict(orient="records")
+    rows = fetch_ohlcv(symbol, interval, limit)
     return {"exchange": "binance", "symbol": symbol, "interval": interval, "rows": rows}
 
-@app.get("/indicators")
+# -----------------------------------------------------------------------------
+# /indicators（回傳最新一根的指標）
+# -----------------------------------------------------------------------------
+@app.get("/indicators", summary="指標（最新一根）")
 def get_indicators(
-    symbol: str = Query(SYMBOL_DEFAULT),
+    symbol: str = Query(..., example="XRP/USDT"),
     interval: str = Query("15m", regex="^(5m|15m|30m|1h|4h|1d)$"),
-    limit: int = Query(200, ge=50, le=500)
+    limit: int = Query(200, ge=50, le=500),
+    bbands: int = Query(20, ge=5, le=100),
+    sigma: float = Query(2.0, ge=0.5, le=4.0),
 ):
-    df = fetch_klines(symbol, interval, limit)
-    close = df["close"]
-    k, d, j = calc_kdj(df, 9)
-    dif, dea, hist = calc_macd(close, 12, 26, 9)
-    ma, upper, lower = calc_bbands(close, 20, 2.0)
+    rows = fetch_ohlcv(symbol, interval, limit)
+    if len(rows) < max(bbands, 26) + 5:
+        raise HTTPException(400, "not enough data for indicators")
 
-    last = {
-        "ts": int(df["ts"].iloc[-1]),
-        "open": round4(df["open"].iloc[-1]),
-        "high": round4(df["high"].iloc[-1]),
-        "low": round4(df["low"].iloc[-1]),
-        "close": round4(df["close"].iloc[-1]),
-        "volume": float(df["volume"].iloc[-1])
-    }
-    out = {
+    df = pd.DataFrame(rows).set_index(pd.to_datetime([r["ts"] for r in rows], unit="ms", utc=True))
+    close = pd.Series([r["close"] for r in rows], index=df.index)
+    high = pd.Series([r["high"] for r in rows], index=df.index)
+    low  = pd.Series([r["low"]  for r in rows], index=df.index)
+
+    # BBands
+    mid = close.rolling(bbands).mean()
+    std = close.rolling(bbands).std(ddof=0)
+    upper = mid + sigma * std
+    lower = mid - sigma * std
+
+    # KDJ (9,3,3)
+    low_n  = low.rolling(9).min()
+    high_n = high.rolling(9).max()
+    rsv = (close - low_n) / (high_n - low_n) * 100
+    k = rsv.ewm(com=2).mean()
+    d = k.ewm(com=2).mean()
+    j = 3*k - 2*d
+
+    # MACD (12,26,9)
+    ema_fast = close.ewm(span=12, adjust=False).mean()
+    ema_slow = close.ewm(span=26, adjust=False).mean()
+    macd_val = ema_fast - ema_slow
+    signal = macd_val.ewm(span=9, adjust=False).mean()
+    hist = macd_val - signal
+
+    last = rows[-1]
+    return {
         "exchange": "binance",
         "symbol": symbol,
         "interval": interval,
-        "last": last,
+        "last": {
+            "open": last["open"], "high": last["high"], "low": last["low"],
+            "close": last["close"], "volume": last["volume"],
+        },
         "bbands": {
-            "upper": round4(upper.iloc[-1]),
-            "middle": round4(ma.iloc[-1]),
-            "lower": round4(lower.iloc[-1]),
-            "sigma": 2
+            "upper": round(float(upper.iloc[-1]), 6),
+            "middle": round(float(mid.iloc[-1]), 6),
+            "lower": round(float(lower.iloc[-1]), 6),
+            "sigma": sigma
         },
         "kdj": {
-            "k": float(f"{k.iloc[-1]:.2f}"),
-            "d": float(f"{d.iloc[-1]:.2f}"),
-            "j": float(f"{j.iloc[-1]:.2f}")
+            "k": round(float(k.iloc[-1]), 3),
+            "d": round(float(d.iloc[-1]), 3),
+            "j": round(float(j.iloc[-1]), 3),
         },
         "macd": {
-            "dif": float(f"{dif.iloc[-1]:.4f}"),
-            "dea": float(f"{dea.iloc[-1]:.4f}"),
-            "hist": float(f"{hist.iloc[-1]:.4f}")
+            "dif": round(float(macd_val.iloc[-1]), 6),
+            "dea": round(float(signal.iloc[-1]), 6),
+            "hist": round(float(hist.iloc[-1]), 6),
+            "fast": 12, "slow": 26, "signal": 9
         }
     }
-    return out
 
-@app.get("/chart")
+# -----------------------------------------------------------------------------
+# /chart（穩定版）
+# -----------------------------------------------------------------------------
+@app.get("/chart", summary="K線圖（可含成交量＋指標）", description="回傳 image/png | image/webp | image/jpeg")
 def get_chart(
-    symbol: str = Query(SYMBOL_DEFAULT),
+    symbol: str = Query(..., example="XRP/USDT"),
     interval: str = Query("15m", regex="^(5m|15m|30m|1h|4h|1d)$"),
-    limit: int = Query(300, ge=100, le=500),
-    sma: int = Query(20, ge=2, le=200),
-    bbands: int = Query(20, ge=5, le=100),
+    limit: int = Query(200, ge=50, le=500, example=300),
+    sma: int = Query(30, ge=2, le=200, description="簡單移動平均"),
+    bbands: int = Query(20, ge=5, le=100, description="布林通道 N"),
+    sigma: float = Query(2.0, ge=0.5, le=4.0, description="布林 K（標準差倍數）"),
     show_kdj: bool = Query(True),
     show_macd: bool = Query(True),
-    volume: bool = Query(True)
+    volume: bool = Query(True),
+    width: int = Query(980, ge=480, le=1920),
+    height: int = Query(480, ge=320, le=1080),
+    dpi: int = Query(110, ge=72, le=200),
+    tight: bool = Query(True),
+    ext: str = Query("png", regex="^(png|webp|jpg|jpeg)$"),
 ):
-    df = fetch_klines(symbol, interval, limit)
-    close = df["close"]
-    ma20 = close.rolling(20).mean()
-    ma50 = close.rolling(50).mean()
-    ma, upper, lower = calc_bbands(close, bbands, 2.0)
+    rows = fetch_ohlcv(symbol, interval, limit)
+    if not rows:
+        raise HTTPException(404, "No OHLCV data")
 
-    k, d, j = calc_kdj(df, 9)
-    dif, dea, hist = calc_macd(close, 12, 26, 9)
+    df = pd.DataFrame(rows)
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("Asia/Taipei")
+    df = df.set_index("ts").sort_index()
 
-    # figure 佈局：上面主圖；下面兩圖（可選）
-    rows = 1 + int(show_kdj) + int(show_macd)
-    height = 2.8 * rows
-    fig, axes = plt.subplots(rows, 1, figsize=(10, height), sharex=True,
-                             gridspec_kw={"height_ratios": [2] + [1]*(rows-1)})
+    fig = plt.figure(figsize=(width / 100, height / 100), dpi=dpi)
+    ax_price = fig.add_subplot(1, 1, 1)
 
-    if rows == 1:
-        ax = axes
-        sub_axes = []
-    else:
-        ax = axes[0]
-        sub_axes = axes[1:]
+    # 盡量用 K 線；沒有 mplfinance 就退化
+    try:
+        import mplfinance as mpf
+        mdf = df.rename(columns={
+            "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"
+        })
+        addplots = []
 
-    x = np.arange(len(df))
-    # K 線（以蠟燭條顯示）
-    up = df["close"] >= df["open"]
-    down = ~up
-    # 上漲
-    ax.bar(x[up], (df["close"] - df["open"])[up], bottom=df["open"][up], color="#26a69a", width=0.6)
-    ax.vlines(x[up], df["low"][up], df["high"][up], color="#26a69a", linewidth=1)
-    # 下跌
-    ax.bar(x[down], (df["close"] - df["open"])[down], bottom=df["open"][down], color="#ef5350", width=0.6)
-    ax.vlines(x[down], df["low"][down], df["high"][down], color="#ef5350", linewidth=1)
+        # SMA
+        if sma:
+            addplots.append(mpf.make_addplot(mdf["Close"].rolling(sma).mean(), color="tab:blue"))
 
-    # SMA 與 BB
-    ax.plot(x, ma20, linewidth=1, label="SMA20")
-    ax.plot(x, ma50, linewidth=1, label="SMA50")
-    ax.plot(x, upper, linewidth=1, linestyle="--", label="BB upper")
-    ax.plot(x, ma, linewidth=1, linestyle="--", label="BB mid")
-    ax.plot(x, lower, linewidth=1, linestyle="--", label="BB lower")
+        # BBands
+        if bbands:
+            mid = mdf["Close"].rolling(bbands).mean()
+            std = mdf["Close"].rolling(bbands).std(ddof=0)
+            upper = mid + sigma * std
+            lower = mid - sigma * std
+            addplots.append(mpf.make_addplot(upper, color="tab:gray"))
+            addplots.append(mpf.make_addplot(mid, color="tab:orange"))
+            addplots.append(mpf.make_addplot(lower, color="tab:gray"))
 
-    if volume:
-        vol_ax = ax.twinx()
-        vol_ax.bar(x, df["volume"], alpha=0.2, width=0.6, color="#90caf9")
-        vol_ax.set_yticklabels([])
+        addpanels = 0
 
-    ax.set_title(f"{symbol}  {interval}  ({limit} bars)")
-    ax.legend(loc="upper left")
-    ax.grid(alpha=0.2)
+        if show_macd:
+            macd_fast = mdf["Close"].ewm(span=12, adjust=False).mean()
+            macd_slow = mdf["Close"].ewm(span=26, adjust=False).mean()
+            macd = macd_fast - macd_slow
+            signal = macd.ewm(span=9, adjust=False).mean()
+            addplots.append(mpf.make_addplot(macd, panel=addpanels+1, color="tab:green"))
+            addplots.append(mpf.make_addplot(signal, panel=addpanels+1, color="tab:red"))
+            addpanels += 1
 
-    idx = 0
-    if show_kdj and idx < len(sub_axes):
-        ax2 = sub_axes[idx]; idx += 1
-        ax2.plot(x, k, label="K")
-        ax2.plot(x, d, label="D")
-        ax2.plot(x, j, label="J")
-        ax2.legend(loc="upper left"); ax2.grid(alpha=0.2)
+        if show_kdj:
+            low_n = mdf["Low"].rolling(9).min()
+            high_n = mdf["High"].rolling(9).max()
+            rsv = (mdf["Close"] - low_n) / (high_n - low_n) * 100
+            k = rsv.ewm(com=2).mean()
+            d = k.ewm(com=2).mean()
+            j = 3 * k - 2 * d
+            addplots.append(mpf.make_addplot(k, panel=addpanels+1, color="tab:blue"))
+            addplots.append(mpf.make_addplot(d, panel=addpanels+1, color="tab:orange"))
+            addplots.append(mpf.make_addplot(j, panel=addpanels+1, color="tab:purple"))
+            addpanels += 1
 
-    if show_macd and idx < len(sub_axes):
-        ax3 = sub_axes[idx]; idx += 1
-        ax3.plot(x, dif, label="DIF")
-        ax3.plot(x, dea, label="DEA")
-        ax3.bar(x, hist, label="HIST", color=np.where(hist >= 0, "#26a69a", "#ef5350"), alpha=0.4)
-        ax3.legend(loc="upper left"); ax3.grid(alpha=0.2)
+        mpf.plot(
+            mdf,
+            type="candle",
+            ax=ax_price,
+            addplot=addplots if addplots else None,
+            volume=volume,
+            style="yahoo",
+            warn_too_much_data=0,
+        )
+    except Exception:
+        # 無 mplfinance：退化畫法
+        ax_price.plot(df.index, df["close"], linewidth=1.25)
+        if sma:
+            ax_price.plot(df.index, df["close"].rolling(sma).mean(), linewidth=1.0)
+        if bbands:
+            mid = df["close"].rolling(bbands).mean()
+            std = df["close"].rolling(bbands).std(ddof=0)
+            upper = mid + sigma * std
+            lower = mid - sigma * std
+            ax_price.plot(df.index, upper, linewidth=0.9)
+            ax_price.plot(df.index, mid, linewidth=0.9)
+            ax_price.plot(df.index, lower, linewidth=0.9)
+        if volume:
+            ax_v = ax_price.twinx()
+            ax_v.bar(df.index, df["volume"], alpha=0.15, width=0.0008)
 
-    plt.tight_layout()
-    data = save_png_under(fig, target_kb=150)
+    buf = io.BytesIO()
+    out_ext = "jpeg" if ext in ("jpg", "jpeg") else ext
+    fig.savefig(buf, format=out_ext, bbox_inches=("tight" if tight else None))
     plt.close(fig)
-    return StreamingResponse(io.BytesIO(data), media_type="image/png")
+    return Response(buf.getvalue(), media_type=f"image/{out_ext}")
 
-# ===== 經驗紀錄 =====
-@app.post("/experience/log")
-def post_experience(payload: Dict[str, Any]):
-    """
-    {
-      "symbol": "XRP/USDT",
-      "interval": "15m",
-      "pattern": "three_white_soldiers",
-      "outcome": "bullish",
-      "notes": "收斂箱體突破後..."
-    }
-    """
-    symbol = payload.get("symbol", SYMBOL_DEFAULT)
-    interval = payload.get("interval", "15m")
-    pattern = payload.get("pattern", "")
-    outcome = payload.get("outcome", "")
-    notes = payload.get("notes", "")
+# -----------------------------------------------------------------------------
+# /chart/quick（超簡版）
+# -----------------------------------------------------------------------------
+@app.get("/chart/quick", summary="快速 K 線圖（預設值）")
+def get_chart_quick(
+    symbol: str = Query(..., example="XRP/USDT"),
+    interval: str = Query("15m", regex="^(5m|15m|30m|1h|4h|1d)$"),
+):
+    return get_chart(
+        symbol=symbol, interval=interval,
+        limit=200, sma=30, bbands=20, sigma=2.0,
+        show_kdj=True, show_macd=True, volume=False,
+        width=980, height=480, dpi=110, tight=True, ext="png",
+    )
 
-    ts = int(time.time() * 1000)
-    db_insert(ts, symbol, interval, pattern, outcome, notes)
-    return {"ok": True, "saved": True, "ts": ts, "time_local": local_str(ts)}
+# -----------------------------------------------------------------------------
+# Experience Log（持久化）
+# -----------------------------------------------------------------------------
+@app.post("/experience/log", summary="寫入經驗")
+def post_experience_log(
+    payload: dict = Body(..., example={
+        "symbol": "XRP/USDT", "interval": "15m",
+        "pattern": "hammer", "outcome": "bullish",
+        "notes": "收盤突破MA30，量能溫和放大。"
+    })
+):
+    required = {"symbol", "interval", "pattern", "outcome"}
+    if not required.issubset(payload.keys()):
+        raise HTTPException(400, f"missing fields: {required - set(payload.keys())}")
 
-@app.get("/experience/recent")
-def get_experience_recent(n: int = Query(20, ge=1, le=200)):
-    rows = db_recent(n)
-    return {"ok": True, "items": rows}
+    # 基本檢查
+    interval = payload["interval"]
+    if interval not in TF_ALLOW:
+        raise HTTPException(400, f"interval must be in {sorted(TF_ALLOW)}")
 
-# ===== 可選：每 15 分鐘自動分析（預設關閉）。設環境變數 AUTO_ANALYZE=true 啟用 =====
-_auto_started = False
+    db = SessionLocal()
+    try:
+        rec = Experience(
+            symbol=payload["symbol"],
+            interval=payload["interval"],
+            pattern=payload["pattern"],
+            outcome=payload["outcome"],
+            notes=payload.get("notes") or "",
+            ts=datetime.now(timezone.utc),
+        )
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+        return {
+            "id": rec.id,
+            "symbol": rec.symbol,
+            "interval": rec.interval,
+            "pattern": rec.pattern,
+            "outcome": rec.outcome,
+            "notes": rec.notes,
+            "ts": int(rec.ts.timestamp() * 1000),
+            "time_local": zh_time(rec.ts.astimezone()),
+        }
+    finally:
+        db.close()
 
-def _auto_worker():
-    while True:
-        try:
-            df = fetch_klines(SYMBOL_DEFAULT, "15m", 120)
-            # 簡單範例：連續 3 根紅棒（three white soldiers）偵測
-            closes = df["close"].values
-            opens = df["open"].values
-            cond = (closes[-1] > opens[-1]) and (closes[-2] > opens[-2]) and (closes[-3] > opens[-3]) \
-                   and (closes[-1] > closes[-2] > closes[-3])
-            if cond:
-                db_insert(int(time.time()*1000), SYMBOL_DEFAULT, "15m", "three_white_soldiers", "bullish", "auto")
-        except Exception as e:
-            print("[auto] error:", e)
-        # 15 分鐘跑一次
-        time.sleep(900)
+@app.get("/experience/recent", summary="最近經驗")
+def get_experience_recent(limit: int = Query(20, ge=1, le=100)):
+    db = SessionLocal()
+    try:
+        q = db.query(Experience).order_by(Experience.id.desc()).limit(limit).all()
+        items = []
+        for r in q:
+            items.append({
+                "id": r.id, "symbol": r.symbol, "interval": r.interval,
+                "pattern": r.pattern, "outcome": r.outcome,
+                "notes": r.notes,
+                "ts": int(r.ts.timestamp() * 1000),
+                "time_local": zh_time(r.ts.astimezone())
+            })
+        return {"items": items}
+    finally:
+        db.close()
 
-def maybe_start_auto():
-    global _auto_started
-    if _auto_started:
-        return
-    if os.getenv("AUTO_ANALYZE", "false").lower() == "true":
-        t = threading.Thread(target=_auto_worker, daemon=True)
-        t.start()
-        _auto_started = True
-
-maybe_start_auto()
+# -----------------------------------------------------------------------------
+# main
+# -----------------------------------------------------------------------------
+# Render 通常會用 uvicorn 指令啟動，不一定要 __main__。
+# 保留以下以便本地測試：
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)

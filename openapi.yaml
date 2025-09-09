@@ -2,8 +2,7 @@ openapi: 3.1.0
 info:
   title: XRP Pattern Scanner Actions
   version: "0.1.0"
-  description: 提供 XRP/USDT 即時現價、K 線、技術指標與圖像輸出（含成交量、BB、KDJ、MACD）。
-
+  description: 取得 XRP/USDT 即時價格、K 線、技術指標與圖像，並可寫入/讀取分析經驗。
 servers:
   - url: https://xrp-actions.onrender.com
 
@@ -13,34 +12,34 @@ paths:
       summary: Root
       operationId: root
       responses:
-        "200": { description: OK }
+        "200":
+          description: OK
 
   /price:
     get:
-      summary: Price
+      summary: Current price
       operationId: getPrice
       parameters:
         - in: query
           name: symbol
           required: true
-          schema: { type: string, example: XRP/USDT }
-        - in: query
-          name: source
-          required: false
-          description: "價格來源：book(買賣一中間價) 或 ticker(上一筆成交價)"
-          schema:
-            type: string
-            enum: [book, ticker]
-            default: book
+          schema: { type: string }
+          example: XRP/USDT
         - in: query
           name: precision
+          description: 小數位數（四捨五入）
           required: false
-          description: "價格小數位數"
+          schema: { type: integer, minimum: 0, maximum: 10, default: 4 }
+          example: 4
+        - in: query
+          name: source
+          description: 價源（ticker=撮合成交價；book=訂單簿近似）
+          required: false
           schema:
-            type: integer
-            minimum: 0
-            maximum: 10
-            default: 4
+            type: string
+            enum: [ticker, book]
+            default: book
+          example: book
       responses:
         "200":
           description: Current price
@@ -57,15 +56,20 @@ paths:
         - in: query
           name: symbol
           required: true
-          schema: { type: string, example: XRP/USDT }
+          schema: { type: string }
+          example: XRP/USDT
         - in: query
           name: interval
-          required: false
-          schema: { type: string, enum: [5m, 15m, 30m, 1h, 4h, 1d], default: 15m }
+          required: true
+          schema:
+            type: string
+            enum: [5m, 15m, 30m, 1h, 4h, 1d]
+          example: 15m
         - in: query
           name: limit
           required: false
-          schema: { type: integer, minimum: 5, maximum: 1000, default: 200 }
+          schema: { type: integer, minimum: 50, maximum: 500, default: 200 }
+          example: 200
       responses:
         "200":
           description: OHLCV rows
@@ -75,33 +79,38 @@ paths:
                 type: object
                 properties:
                   exchange: { type: string, example: binance }
-                  symbol:   { type: string, example: XRP/USDT }
+                  symbol: { type: string, example: XRP/USDT }
                   interval: { type: string, example: 15m }
                   rows:
                     type: array
                     items:
-                      $ref: "#/components/schemas/OHLCVRow"
+                      $ref: "#/components/schemas/OHLCV"
 
   /indicators:
     get:
-      summary: Indicators
+      summary: Indicators (BB/KDJ/MACD)
       operationId: getIndicators
       parameters:
         - in: query
           name: symbol
           required: true
-          schema: { type: string, example: XRP/USDT }
+          schema: { type: string }
+          example: XRP/USDT
         - in: query
           name: interval
-          required: false
-          schema: { type: string, enum: [5m, 15m, 30m, 1h, 4h, 1d], default: 15m }
+          required: true
+          schema:
+            type: string
+            enum: [5m, 15m, 30m, 1h, 4h, 1d]
+          example: 15m
         - in: query
           name: limit
           required: false
-          schema: { type: integer, minimum: 30, maximum: 1000, default: 200 }
+          schema: { type: integer, minimum: 50, maximum: 200, default: 200 }
+          example: 200
       responses:
         "200":
-          description: Indicators
+          description: Indicators snapshot
           content:
             application/json:
               schema:
@@ -109,28 +118,66 @@ paths:
 
   /chart:
     get:
-      summary: Chart (image/png)
+      summary: Candlestick chart (PNG)
       operationId: getChart
       parameters:
-        - { in: query, name: symbol,   required: true,  schema: { type: string, example: XRP/USDT } }
-        - { in: query, name: interval, required: false, schema: { type: string, enum: [5m, 15m, 30m, 1h, 4h, 1d], default: 15m } }
-        - { in: query, name: limit,    required: false, schema: { type: integer, minimum: 30, maximum: 300, default: 200 } }
-        - { in: query, name: sma20,    required: false, schema: { type: integer, minimum: 2, maximum: 200, default: 20 } }
-        - { in: query, name: sma50,    required: false, schema: { type: integer, minimum: 2, maximum: 300, default: 50 } }
-        - { in: query, name: bbands,   required: false, schema: { type: integer, minimum: 5, maximum: 100, default: 20 }, description: "BB 週期，K=2 固定" }
-        - { in: query, name: show_kdj, required: false, schema: { type: boolean, default: false } }
-        - { in: query, name: show_macd,required: false, schema: { type: boolean, default: false } }
-        - { in: query, name: volume,   required: false, schema: { type: boolean, default: true } }
+        - in: query
+          name: symbol
+          required: true
+          schema: { type: string }
+          example: XRP/USDT
+        - in: query
+          name: interval
+          required: true
+          schema:
+            type: string
+            enum: [5m, 15m, 30m, 1h, 4h, 1d]
+          example: 15m
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 100, maximum: 500, default: 300 }
+          example: 300
+        - in: query
+          name: sma
+          description: 簡單移動平均（單一週期）
+          required: false
+          schema: { type: integer, minimum: 2, maximum: 200, default: 20 }
+          example: 20
+        - in: query
+          name: bbands
+          description: 布林帶週期（K=2 固定）
+          required: false
+          schema: { type: integer, minimum: 5, maximum: 100, default: 20 }
+          example: 20
+        - in: query
+          name: show_kdj
+          required: false
+          schema: { type: boolean, default: true }
+          example: true
+        - in: query
+          name: show_macd
+          required: false
+          schema: { type: boolean, default: true }
+          example: true
+        - in: query
+          name: volume
+          description: 是否顯示成交量
+          required: false
+          schema: { type: boolean, default: true }
+          example: true
       responses:
         "200":
-          description: PNG Image
+          description: PNG image
           content:
             image/png:
-              schema: { type: string, format: binary }
+              schema:
+                type: string
+                format: binary
 
   /experience/log:
     post:
-      summary: Experience Log
+      summary: Write one analysis experience
       operationId: postExperienceLog
       requestBody:
         required: true
@@ -139,85 +186,120 @@ paths:
             schema:
               $ref: "#/components/schemas/ExperienceLogIn"
       responses:
-        "200": { description: Saved }
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, example: true }
+                  id: { type: string, example: "e3f5c1a…" }
 
   /experience/recent:
     get:
-      summary: Experience Recent
+      summary: Read recent experiences
       operationId: getExperienceRecent
       parameters:
         - in: query
-          name: limit
+          name: n
+          description: 取回筆數
           required: false
-          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+          example: 10
       responses:
-        "200": { description: OK }
+        "200":
+          description: Recent items
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExperienceRecent"
 
 components:
   schemas:
-    OHLCVRow:
-      type: object
-      properties:
-        ts:     { type: integer, example: 1757362813878 }
-        open:   { type: number, example: 0.4925 }
-        high:   { type: number, example: 0.4990 }
-        low:    { type: number, example: 0.4880 }
-        close:  { type: number, example: 0.4950 }
-        volume: { type: number, example: 123456.78 }
-
     PriceResponse:
       type: object
       properties:
-        exchange:  { type: string,  example: binance }
-        symbol:    { type: string,  example: XRP/USDT }
-        price:     { type: number,  example: 0.4925 }
-        ts:        { type: integer, example: 1757362813878 }
-        time_local:{ type: string,  example: "下午 03 點 27 分" }
+        exchange: { type: string, example: binance }
+        symbol: { type: string, example: XRP/USDT }
+        price: { type: number, example: 2.9725 }
+        ts: { type: integer, example: 1757362813878 }
+        time_local: { type: string, example: "下午 03 點 21 分" }
+
+    OHLCV:
+      type: object
+      properties:
+        ts:   { type: integer, example: 1757328000000 }
+        open:  { type: number, example: 2.8824 }
+        high:  { type: number, example: 2.9790 }
+        low:   { type: number, example: 2.8750 }
+        close: { type: number, example: 2.9734 }
+        volume:{ type: number, example: 213440.5 }
 
     IndicatorsResponse:
       type: object
       properties:
-        exchange:  { type: string, example: binance }
-        symbol:    { type: string, example: XRP/USDT }
-        interval:  { type: string, example: 15m }
+        exchange: { type: string, example: binance }
+        symbol: { type: string, example: XRP/USDT }
+        interval: { type: string, example: 15m }
         last:
           type: object
           properties:
-            open:   { type: number, example: 0.4925 }
-            high:   { type: number, example: 0.4979 }
-            low:    { type: number, example: 0.4897 }
-            close:  { type: number, example: 0.4976 }
-            volume: { type: number, example: 213440.5 }
-            ts:     { type: integer, example: 1757362813878 }
+            open:  { type: number, example: 2.9700 }
+            high:  { type: number, example: 2.9790 }
+            low:   { type: number, example: 2.9730 }
+            close: { type: number, example: 2.9734 }
+            volume:{ type: number, example: 213440.5 }
         bbands:
           type: object
           properties:
-            upper:  { type: number, example: 0.5022 }
-            middle: { type: number, example: 0.4962 }
-            lower:  { type: number, example: 0.4903 }
-            sigma:  { type: integer, example: 2 }
+            upper: { type: number, example: 2.9862 }
+            middle:{ type: number, example: 2.9670 }
+            lower: { type: number, example: 2.9480 }
+            k:     { type: number, example: 2 }
+            n:     { type: integer, example: 20 }
         kdj:
           type: object
           properties:
             k: { type: number, example: 49.85 }
-            d: { type: number, example: 55.28 }
-            j: { type: number, example: 39.08 }
+            d: { type: number, example: 55.285 }
+            j: { type: number, example: 39.077 }
         macd:
           type: object
           properties:
-            diff:   { type: number, example: 0.0041 }
-            dea:    { type: number, example: 0.0057 }
-            hist:   { type: number, example: -0.0016 }
-            fast:   { type: integer, example: 12 }
-            slow:   { type: integer, example: 26 }
-            signal: { type: integer, example: 9 }
+            dif:   { type: number, example: 0.0041 }
+            dea:   { type: number, example: 0.0057 }
+            hist:  { type: number, example: -0.0016 }
+            fast:  { type: integer, example: 12 }
+            slow:  { type: integer, example: 26 }
+            signal:{ type: integer, example: 9 }
 
     ExperienceLogIn:
       type: object
-      required: [symbol, interval]
+      required: [symbol, interval, pattern, outcome]
       properties:
-        symbol:  { type: string,  example: XRP/USDT }
-        interval:{ type: string,  example: 15m }
-        pattern: { type: string,  example: "three_white_soldiers" }
-        outcome: { type: string,  example: "bullish" }
-        notes:   { type: string,  example: "依照《蠟燭圖精解》章節 X 的定義..." }
+        symbol:   { type: string, example: XRP/USDT }
+        interval: { type: string, example: 15m }
+        pattern:  { type: string, example: three_white_soldiers }
+        outcome:  { type: string, example: bullish }
+        notes:    { type: string, example: "依《蠟燭圖精解》章節要點，突破伴隨量能放大。" }
+
+    ExperienceItem:
+      type: object
+      properties:
+        id: { type: string, example: "e3f5c1a…" }
+        ts: { type: integer, example: 1757362813878 }
+        time_local: { type: string, example: "下午 03 點 21 分" }
+        symbol: { type: string, example: XRP/USDT }
+        interval: { type: string, example: 15m }
+        pattern: { type: string, example: three_white_soldiers }
+        outcome: { type: string, example: bullish }
+        notes: { type: string, example: "回測支撐有效；量能維持。" }
+
+    ExperienceRecent:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExperienceItem"
