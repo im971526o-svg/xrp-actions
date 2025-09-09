@@ -1,6 +1,9 @@
-fastapi>=0.111
-uvicorn[standard]>=0.30
-ccxt>=4.2
-pandas>=2.2
-numpy>=1.26
-matplotlib>=3.8
+fastapi
+uvicorn
+ccxt
+pandas
+numpy
+matplotlib
+pillow
+sqlalchemy
+psycopg2-binary
