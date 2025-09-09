@@ -1,100 +1,223 @@
 openapi: 3.1.0
 info:
   title: XRP Pattern Scanner Actions
-  version: "1.0.0"
+  version: "0.1.0"
+  description: 提供 XRP/USDT 即時現價、K 線、技術指標與圖像輸出（含成交量、BB、KDJ、MACD）。
+
 servers:
-  - url: https://bdfe26015670.ngrok-free.app
+  - url: https://xrp-actions.onrender.com
+
 paths:
-  /scan:
+  /:
     get:
-      operationId: scan
-      summary: Scan XRP/USDT for candlestick patterns across intervals
+      summary: Root
+      operationId: root
+      responses:
+        "200": { description: OK }
+
+  /price:
+    get:
+      summary: Price
+      operationId: getPrice
       parameters:
-        - name: symbol
-          in: query
+        - in: query
+          name: symbol
+          required: true
+          schema: { type: string, example: XRP/USDT }
+        - in: query
+          name: source
           required: false
+          description: "價格來源：book(買賣一中間價) 或 ticker(上一筆成交價)"
           schema:
             type: string
-            default: XRP/USDT
-        - name: intervals
-          in: query
+            enum: [book, ticker]
+            default: book
+        - in: query
+          name: precision
           required: false
-          description: Comma-separated list among 15m,1h,4h,1d
-          schema:
-            type: string
-            default: 15m,1h,4h,1d
-        - name: lookback
-          in: query
-          required: false
-          description: Candles to fetch per interval (10..1000)
+          description: "價格小數位數"
           schema:
             type: integer
-            default: 200
+            minimum: 0
+            maximum: 10
+            default: 4
       responses:
-        '200':
-          description: OK
+        "200":
+          description: Current price
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ScanResponse'
-  /explain:
+                $ref: "#/components/schemas/PriceResponse"
+
+  /klines:
     get:
-      operationId: explain
-      summary: Explain a specific detection and return evidence window + rationale
+      summary: Klines
+      operationId: getKlines
       parameters:
-        - name: pattern_id
-          in: query
+        - in: query
+          name: symbol
           required: true
-          schema:
-            type: string
+          schema: { type: string, example: XRP/USDT }
+        - in: query
+          name: interval
+          required: false
+          schema: { type: string, enum: [5m, 15m, 30m, 1h, 4h, 1d], default: 15m }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 5, maximum: 1000, default: 200 }
       responses:
-        '200':
-          description: OK
+        "200":
+          description: OHLCV rows
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ExplainResponse'
+                type: object
+                properties:
+                  exchange: { type: string, example: binance }
+                  symbol:   { type: string, example: XRP/USDT }
+                  interval: { type: string, example: 15m }
+                  rows:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/OHLCVRow"
+
+  /indicators:
+    get:
+      summary: Indicators
+      operationId: getIndicators
+      parameters:
+        - in: query
+          name: symbol
+          required: true
+          schema: { type: string, example: XRP/USDT }
+        - in: query
+          name: interval
+          required: false
+          schema: { type: string, enum: [5m, 15m, 30m, 1h, 4h, 1d], default: 15m }
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 30, maximum: 1000, default: 200 }
+      responses:
+        "200":
+          description: Indicators
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndicatorsResponse"
+
+  /chart:
+    get:
+      summary: Chart (image/png)
+      operationId: getChart
+      parameters:
+        - { in: query, name: symbol,   required: true,  schema: { type: string, example: XRP/USDT } }
+        - { in: query, name: interval, required: false, schema: { type: string, enum: [5m, 15m, 30m, 1h, 4h, 1d], default: 15m } }
+        - { in: query, name: limit,    required: false, schema: { type: integer, minimum: 30, maximum: 300, default: 200 } }
+        - { in: query, name: sma20,    required: false, schema: { type: integer, minimum: 2, maximum: 200, default: 20 } }
+        - { in: query, name: sma50,    required: false, schema: { type: integer, minimum: 2, maximum: 300, default: 50 } }
+        - { in: query, name: bbands,   required: false, schema: { type: integer, minimum: 5, maximum: 100, default: 20 }, description: "BB 週期，K=2 固定" }
+        - { in: query, name: show_kdj, required: false, schema: { type: boolean, default: false } }
+        - { in: query, name: show_macd,required: false, schema: { type: boolean, default: false } }
+        - { in: query, name: volume,   required: false, schema: { type: boolean, default: true } }
+      responses:
+        "200":
+          description: PNG Image
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+
+  /experience/log:
+    post:
+      summary: Experience Log
+      operationId: postExperienceLog
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExperienceLogIn"
+      responses:
+        "200": { description: Saved }
+
+  /experience/recent:
+    get:
+      summary: Experience Recent
+      operationId: getExperienceRecent
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+      responses:
+        "200": { description: OK }
+
 components:
   schemas:
-    Detection:
+    OHLCVRow:
       type: object
       properties:
-        id: { type: string }
-        symbol: { type: string }
-        interval: { type: string, enum: [15m,1h,4h,1d] }
-        pattern_name: { type: string }
-        direction: { type: string, enum: [bullish, bearish, neutral] }
-        confidence: { type: number }
-        t_start: { type: integer }
-        t_end: { type: integer }
-        index_range:
-          type: array
-          items: { type: integer }
-        extra:
-          type: object
-    ScanResponse:
+        ts:     { type: integer, example: 1757362813878 }
+        open:   { type: number, example: 0.4925 }
+        high:   { type: number, example: 0.4990 }
+        low:    { type: number, example: 0.4880 }
+        close:  { type: number, example: 0.4950 }
+        volume: { type: number, example: 123456.78 }
+
+    PriceResponse:
       type: object
       properties:
-        detections:
-          type: array
-          items:
-            $ref: '#/components/schemas/Detection'
-        meta:
-          type: object
-    ExplainResponse:
+        exchange:  { type: string,  example: binance }
+        symbol:    { type: string,  example: XRP/USDT }
+        price:     { type: number,  example: 0.4925 }
+        ts:        { type: integer, example: 1757362813878 }
+        time_local:{ type: string,  example: "下午 03 點 27 分" }
+
+    IndicatorsResponse:
       type: object
       properties:
-        detection:
-          $ref: '#/components/schemas/Detection'
-        evidence:
+        exchange:  { type: string, example: binance }
+        symbol:    { type: string, example: XRP/USDT }
+        interval:  { type: string, example: 15m }
+        last:
           type: object
-        rationale:
-          type: string
-        references:
-          type: array
-          items:
-            type: object
-            properties:
-              title: { type: string }
-              section: { type: string }
-              note: { type: string }
+          properties:
+            open:   { type: number, example: 0.4925 }
+            high:   { type: number, example: 0.4979 }
+            low:    { type: number, example: 0.4897 }
+            close:  { type: number, example: 0.4976 }
+            volume: { type: number, example: 213440.5 }
+            ts:     { type: integer, example: 1757362813878 }
+        bbands:
+          type: object
+          properties:
+            upper:  { type: number, example: 0.5022 }
+            middle: { type: number, example: 0.4962 }
+            lower:  { type: number, example: 0.4903 }
+            sigma:  { type: integer, example: 2 }
+        kdj:
+          type: object
+          properties:
+            k: { type: number, example: 49.85 }
+            d: { type: number, example: 55.28 }
+            j: { type: number, example: 39.08 }
+        macd:
+          type: object
+          properties:
+            diff:   { type: number, example: 0.0041 }
+            dea:    { type: number, example: 0.0057 }
+            hist:   { type: number, example: -0.0016 }
+            fast:   { type: integer, example: 12 }
+            slow:   { type: integer, example: 26 }
+            signal: { type: integer, example: 9 }
+
+    ExperienceLogIn:
+      type: object
+      required: [symbol, interval]
+      properties:
+        symbol:  { type: string,  example: XRP/USDT }
+        interval:{ type: string,  example: 15m }
+        pattern: { type: string,  example: "three_white_soldiers" }
+        outcome: { type: string,  example: "bullish" }
+        notes:   { type: string,  example: "依照《蠟燭圖精解》章節 X 的定義..." }

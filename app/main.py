@@ -1,583 +1,382 @@
-# -*- coding: utf-8 -*-
-"""
-XRP Pattern Scanner & Chart API (FastAPI on Render)
-
-功能總覽
-- /                  : 健康檢查
-- /price             : 現價（precision、ticker/orderbook，time_local=台北時）
-- /klines            : OHLCV 5m/15m/30m/1h/4h/1d
-- /indicators        : BB(20,2)、KDJ(9,3,3)、MACD(12,26,9)
-- /chart             : 圖（實心蠟燭+影線+成交量+KDJ+MACD），圖片壓到 ~150KB
-- /scan              : 《蠟燭圖精解》型態偵測（hammer/射擊之星/十字/吞噬/三白兵/三黑鴉）
-- /experience/*      : 經驗紀錄（DB 持久化）
-- /chat/*            : 聊天紀錄（DB 持久化）
-- /analysis/run      : 一次跑多 timeframe 的分析 → 自動比對前次 → 自動寫入 DB
-- /analysis/recent   : 查最近分析
-- /auto/analyze      : 排程入口（預設 15m；建議配 Render Cron Job），可驗證 token
-
-資料庫
-- 預設 SQLite（檔名 data.db，服務重啟仍在；部署更新會清空）
-- 若設 DATABASE_URL（Postgres），則用 Postgres 永久保存（跨部署不掉）
-"""
-
-import io
+# app/main.py
 import os
-import json
+import io
 import time
 import math
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Dict, List, Literal, Optional, Tuple
+import json
+import sqlite3
+import threading
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
 
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")  # 無頭環境
 import matplotlib.pyplot as plt
 
 from PIL import Image
 
-from fastapi import FastAPI, HTTPException, Query, Body, Depends
-from fastapi.responses import JSONResponse, Response
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse, JSONResponse
 
-# 交易所
 import ccxt
 
-# DB: SQLAlchemy
-from sqlalchemy import (
-    create_engine, Column, Integer, BigInteger, String, Text, Float, DateTime, JSON as SA_JSON, select, desc
-)
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
+APP_NAME = os.getenv("APP_NAME", "XRP Pattern Scanner Actions")
+TZ_NAME = os.getenv("TZ_NAME", "Asia/Taipei")
+SYMBOL_DEFAULT = "XRP/USDT"
 
-APP_NAME   = "XRP Pattern Scanner Actions"
-DEFAULT_TZ = "Asia/Taipei"
-CRON_SECRET = os.getenv("CRON_SECRET")  # 建議設定，給 /auto/analyze 驗證用
+# ===== FastAPI =====
+app = FastAPI(title=APP_NAME)
 
-# -------------------- DB 初始化 --------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data.db")
-engine_kwargs = {}
-if DATABASE_URL.startswith("sqlite"):
-    engine_kwargs["connect_args"] = {"check_same_thread": False}
-engine = create_engine(DATABASE_URL, **engine_kwargs)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-Base = declarative_base()
+# ===== DB (SQLite 檔案，免費 Render 也能用；若要永久化，改用外部 Postgres) =====
+DB_PATH = os.getenv("SQLITE_PATH", "/tmp/xrp_actions.db")
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+def db_init():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS experience_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        symbol TEXT NOT NULL,
+        interval TEXT NOT NULL,
+        pattern TEXT,
+        outcome TEXT,
+        notes TEXT
+    );
+    """)
+    conn.commit()
+    conn.close()
 
-class ChatLog(Base):
-    __tablename__ = "chat_logs"
-    id      = Column(Integer, primary_key=True, autoincrement=True)
-    ts_ms   = Column(BigInteger, index=True)
-    role    = Column(String(16))
-    content = Column(Text)
-    symbol  = Column(String(32), nullable=True)
-    interval= Column(String(16), nullable=True)
-    tags    = Column(Text, nullable=True)  # JSON 字串
+db_init()
 
-class ExperienceLog(Base):
-    __tablename__ = "experience_logs"
-    id       = Column(Integer, primary_key=True, autoincrement=True)
-    ts_ms    = Column(BigInteger, index=True)
-    symbol   = Column(String(32))
-    interval = Column(String(16))
-    pattern  = Column(String(64))
-    outcome  = Column(String(16))
-    notes    = Column(Text)
+def db_insert(ts: int, symbol: str, interval: str, pattern: str, outcome: str, notes: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO experience_log (ts, symbol, interval, pattern, outcome, notes) VALUES (?, ?, ?, ?, ?, ?)",
+        (ts, symbol, interval, pattern, outcome, notes)
+    )
+    conn.commit()
+    conn.close()
 
-class AnalysisLog(Base):
-    __tablename__ = "analysis_logs"
-    id         = Column(Integer, primary_key=True, autoincrement=True)
-    ts_ms      = Column(BigInteger, index=True)
-    symbol     = Column(String(32))
-    interval   = Column(String(16))
-    result_json= Column(Text)   # JSON 字串（指標、型態、重點）
-    delta_json = Column(Text)   # 與前一筆比對的變化（JSON 字串）
-    summary    = Column(Text)   # 簡述（便於列表瀏覽）
+def db_recent(limit: int = 20) -> List[Dict[str, Any]]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT ts, symbol, interval, pattern, outcome, notes FROM experience_log ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    res = []
+    for r in rows:
+        res.append({
+            "ts": r[0],
+            "symbol": r[1],
+            "interval": r[2],
+            "pattern": r[3],
+            "outcome": r[4],
+            "notes": r[5],
+        })
+    return res
 
-Base.metadata.create_all(bind=engine)
+# ===== Helper：時間、四捨五入、圖片壓縮 =====
+def local_str(ts_ms: int, tz_name: str = TZ_NAME) -> str:
+    # pandas 讓我們不加額外套件也能轉 tz
+    dt = pd.Timestamp(ts_ms, unit="ms", tz="UTC").tz_convert(tz_name)
+    hh = int(dt.strftime("%I"))  # 12 小時制，前導零去掉
+    mm = int(dt.strftime("%M"))
+    ap = "上午" if dt.strftime("%p") == "AM" else "下午"
+    return f"{ap} {hh} 點 {mm} 分"
 
-# -------------------- 工具函式 --------------------
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    from pytz import timezone as ZoneInfo  # type: ignore
+def round4(x: float) -> float:
+    return float(f"{x:.4f}")
 
-def local_ts_str(ts_ms: int, tz: str = DEFAULT_TZ) -> str:
-    dt = pd.to_datetime(ts_ms, unit="ms", utc=True).tz_convert(ZoneInfo(tz))  # type: ignore
-    hour = int(dt.strftime("%I"))
-    minute = int(dt.strftime("%M"))
-    ampm = "上午" if dt.strftime("%p") == "AM" else "下午"
-    return f"{ampm} {hour} 點 {minute} 分"
+def save_png_under(fig, target_kb: int = 150) -> bytes:
+    """將 Matplotlib figure 轉 PNG 並嘗試壓到 ~target_kb。"""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.1)
+    data = buf.getvalue()
+    buf.close()
 
-def round_price(x: float, precision: int = 4) -> float:
-    q = Decimal(str(x)).quantize(Decimal("1." + "0" * precision), rounding=ROUND_HALF_UP)
-    return float(q)
+    if len(data) <= target_kb * 1024:
+        return data
 
-def make_exchange() -> ccxt.binance:
-    ex = ccxt.binance({
-        "enableRateLimit": True,
-        "timeout": 15000,
-    })
-    ex.options["adjustForTimeDifference"] = False
+    # 用 PIL 量化壓小
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    for colors in (128, 96, 64, 32):
+        out = io.BytesIO()
+        img_p = img.convert("P", palette=Image.ADAPTIVE, colors=colors)
+        img_p.save(out, format="PNG", optimize=True)
+        d = out.getvalue()
+        out.close()
+        if len(d) <= target_kb * 1024:
+            return d
+    return d  # 實在壓不下就回最後一次
+
+# ===== 交易所：Binance（ccxt）=====
+def binance():
+    ex = ccxt.binance({"enableRateLimit": True})
+    # 避免時間差錯誤
+    ex.options["adjustForTimeDifference"] = True
     return ex
 
-def timeframe_ok(interval: str) -> str:
-    ok = {"5m", "15m", "30m", "1h", "4h", "1d"}
-    if interval not in ok:
-        raise HTTPException(400, f"interval must be one of {sorted(ok)}")
-    return interval
+# ===== 技術指標 =====
+def calc_bbands(close: pd.Series, n: int = 20, k: float = 2.0):
+    ma = close.rolling(n).mean()
+    std = close.rolling(n).std(ddof=0)
+    upper = ma + k * std
+    lower = ma - k * std
+    return ma, upper, lower
 
-def fetch_ohlcv_df(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-    ex = make_exchange()
-    tf = timeframe_ok(interval)
-    data = ex.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-    if not data:
-        raise HTTPException(502, "Empty OHLCV from exchange.")
-    arr = np.array(data, dtype=float)
-    df = pd.DataFrame(arr, columns=["ts", "open", "high", "low", "close", "volume"])
-    df["ts"] = df["ts"].astype(np.int64)
-    return df
-
-# 指標
-def sma(series: np.ndarray, n: int) -> np.ndarray:
-    s = pd.Series(series); return s.rolling(n, min_periods=1).mean().to_numpy()
-
-def ema(series: np.ndarray, n: int) -> np.ndarray:
-    s = pd.Series(series); return s.ewm(span=n, adjust=False).mean().to_numpy()
-
-def calc_bbands(close: np.ndarray, n: int = 20, sigma: float = 2.0):
-    mid = sma(close, n)
-    std = pd.Series(close).rolling(n, min_periods=1).std(ddof=0).to_numpy()
-    upper = mid + sigma * std; lower = mid - sigma * std
-    return upper, mid, lower
-
-def calc_kdj(high: np.ndarray, low: np.ndarray, close: np.ndarray, n: int = 9, m1: int = 3, m2: int = 3):
-    hh = pd.Series(high).rolling(n, min_periods=1).max().to_numpy()
-    ll = pd.Series(low).rolling(n, min_periods=1).min().to_numpy()
-    rsv = np.where(hh - ll == 0, 0, (close - ll) / (hh - ll) * 100.0)
-    k = pd.Series(rsv).ewm(alpha=1 / m1, adjust=False).mean().to_numpy()
-    d = pd.Series(k).ewm(alpha=1 / m2, adjust=False).mean().to_numpy()
+def calc_kdj(df: pd.DataFrame, n: int = 9):
+    low_n = df["low"].rolling(n).min()
+    high_n = df["high"].rolling(n).max()
+    rsv = (df["close"] - low_n) / (high_n - low_n + 1e-9) * 100
+    k = rsv.ewm(alpha=1/3, adjust=False).mean()
+    d = k.ewm(alpha=1/3, adjust=False).mean()
     j = 3 * k - 2 * d
     return k, d, j
 
-def calc_macd(close: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9):
-    ema_fast = ema(close, fast); ema_slow = ema(close, slow)
+def calc_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
     dif = ema_fast - ema_slow
-    dea = pd.Series(dif).ewm(span=signal, adjust=False).mean().to_numpy()
+    dea = dif.ewm(span=signal, adjust=False).mean()
     hist = dif - dea
     return dif, dea, hist
 
-# 型態規則（《蠟燭圖精解》精神）
-def _body(o, c):  return abs(c - o)
-def _upper(o, c, h): return h - max(o, c)
-def _lower(o, c, l): return min(o, c) - l
-def _is_bull(o, c): return c >= o
-def _is_bear(o, c): return c <  o
+# ===== 取 K 線 =====
+def fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+    ex = binance()
+    ms = ex.parse_timeframe(interval) * 1000
+    now = int(time.time() * 1000)
+    since = now - ms * (limit + 5)
+    ohlcv = ex.fetch_ohlcv(symbol, timeframe=interval, since=since, limit=limit)
+    cols = ["ts", "open", "high", "low", "close", "volume"]
+    df = pd.DataFrame(ohlcv, columns=cols)
+    return df
 
-def _atr_like(h, l, n=14):
-    rng = (h - l)
-    s = pd.Series(rng).rolling(n, min_periods=1).mean().to_numpy()
-    s[s == 0] = 1e-9
-    return s
-
-def is_hammer(o, h, l, c, atr, strict=False):
-    b = _body(o, c); up = _upper(o, c, h); dn = _lower(o, c, l)
-    cond = (dn >= (2.5 if strict else 2.0)*b) and (up <= 0.3*b) and (b <= 0.6*atr)
-    score = (dn/b if b>0 else 4.0) + (0.3*b/max(atr,1e-9))
-    return cond, float(min(score/5.0, 1.0))
-
-def is_shooting_star(o, h, l, c, atr, strict=False):
-    b = _body(o, c); up = _upper(o, c, h); dn = _lower(o, c, l)
-    cond = (up >= (2.5 if strict else 2.0)*b) and (dn <= 0.3*b) and (b <= 0.6*atr)
-    score = (up/b if b>0 else 4.0)
-    return cond, float(min(score/5.0, 1.0))
-
-def is_doji(o, h, l, c, atr, strict=False):
-    b = _body(o, c); rng = h - l
-    cond = (b <= (0.08 if strict else 0.12)*rng)
-    score = float(max(0.2, 1.0 - b/max(rng,1e-9)))
-    return cond, score
-
-def is_bullish_engulfing(prev, cur, atr, strict=False):
-    o1,h1,l1,c1 = prev; o2,h2,l2,c2 = cur
-    cond = _is_bear(o1,c1) and _is_bull(o2,c2) and (o2 <= c1) and (c2 >= o1)
-    if strict: cond = cond and (_body(o2,c2) >= max(_body(o1,c1), 0.5*atr))
-    score = float(min(_body(o2,c2)/max(_body(o1,c1),1e-9), 2.0)/2.0)
-    return cond, score
-
-def is_bearish_engulfing(prev, cur, atr, strict=False):
-    o1,h1,l1,c1 = prev; o2,h2,l2,c2 = cur
-    cond = _is_bull(o1,c1) and _is_bear(o2,c2) and (o2 >= c1) and (c2 <= o1)
-    if strict: cond = cond and (_body(o2,c2) >= max(_body(o1,c1), 0.5*atr))
-    score = float(min(_body(o2,c2)/max(_body(o1,c1),1e-9), 2.0)/2.0)
-    return cond, score
-
-def is_three_white_soldiers(trio, atr, strict=False):
-    if len(trio) < 3: return False, 0.0
-    ok = True; bonus = 0.0
-    for i in range(3):
-        o,h,l,c = trio[i]
-        if not _is_bull(o,c): ok=False; break
-        if _upper(o,c,h) > (0.4 if strict else 0.6)*_body(o,c): ok=False; break
-        bonus += _body(o,c)/max(atr,1e-9)
-        if i>0:
-            o0,h0,l0,c0 = trio[i-1]
-            if not (o >= o0 and c >= c0): ok=False; break
-    return ok, float(min(bonus/3.0, 1.0))
-
-def is_three_black_crows(trio, atr, strict=False):
-    if len(trio) < 3: return False, 0.0
-    ok = True; bonus = 0.0
-    for i in range(3):
-        o,h,l,c = trio[i]
-        if not _is_bear(o,c): ok=False; break
-        if _lower(o,c,l) > (0.4 if strict else 0.6)*_body(o,c): ok=False; break
-        bonus += _body(o,c)/max(atr,1e-9)
-        if i>0:
-            o0,h0,l0,c0 = trio[i-1]
-            if not (o <= o0 and c <= c0): ok=False; break
-    return ok, float(min(bonus/3.0, 1.0))
-
-def scan_patterns_df(df: pd.DataFrame, strict=False):
-    out=[]
-    h = df["high"].to_numpy(float); l = df["low"].to_numpy(float)
-    o = df["open"].to_numpy(float); c = df["close"].to_numpy(float)
-    atr = _atr_like(h, l, n=14)
-    n = len(df)
-    for i in range(n):
-        cur = (o[i], h[i], l[i], c[i])
-        ok, sc = is_hammer(*cur, atr[i], strict);         if ok: out.append({"idx": i, "type": "hammer", "score": sc})
-        ok, sc = is_shooting_star(*cur, atr[i], strict);  if ok: out.append({"idx": i, "type": "shooting_star", "score": sc})
-        ok, sc = is_doji(*cur, atr[i], strict);           if ok: out.append({"idx": i, "type": "doji", "score": sc})
-        if i>0:
-            prev = (o[i-1], h[i-1], l[i-1], c[i-1])
-            ok, sc = is_bullish_engulfing(prev, cur, atr[i], strict);  if ok: out.append({"idx": i, "type": "bullish_engulfing", "score": sc})
-            ok, sc = is_bearish_engulfing(prev, cur, atr[i], strict);  if ok: out.append({"idx": i, "type": "bearish_engulfing", "score": sc})
-        if i>=2:
-            trio = [(o[j],h[j],l[j],c[j]) for j in range(i-2, i+1)]
-            ok, sc = is_three_white_soldiers(trio, atr[i], strict); if ok: out.append({"idx": i, "type": "three_white_soldiers", "score": sc})
-            ok, sc = is_three_black_crows(trio, atr[i], strict);   if ok: out.append({"idx": i, "type": "three_black_crows", "score": sc})
-    out.sort(key=lambda x: x["score"], reverse=True)
-    return out
-
-# 蠟燭繪圖
-def draw_candles(ax, df, up="#e74c3c", down="#2ecc71", width=0.7):
-    x = np.arange(len(df))
-    opens  = df["open"].to_numpy(float)
-    highs  = df["high"].to_numpy(float)
-    lows   = df["low"].to_numpy(float)
-    closes = df["close"].to_numpy(float)
-    for i in range(len(df)):
-        o, h, l, c = opens[i], highs[i], lows[i], closes[i]
-        color = up if c >= o else down
-        ax.vlines(i, l, h, color=color, linewidth=1.0, zorder=2)
-        lower  = min(o, c)
-        height = max(o, c) - lower
-        if height == 0: height = max((h - l) * 0.03, 1e-9)
-        rect = plt.Rectangle((i - width/2, lower), width, height,
-                             facecolor=color, edgecolor=color, linewidth=0.8, zorder=3)
-        ax.add_patch(rect)
-    ax.set_xlim(0, len(df) - 1)
-    ax.set_ylim(df["low"].min()*0.995, df["high"].max()*1.005)
-
-def annotate_patterns(ax_price, detections, df):
-    y = df["close"].to_numpy(float)
-    for det in detections:
-        i   = int(det["idx"]); t = det["type"]; sc = det["score"]
-        m   = "^" if ("bull" in t or "white" in t or t=="hammer") else "v"
-        col = "#e74c3c" if m == "^" else "#2ecc71"
-        ax_price.scatter(i, y[i], marker=m, s=60, color=col, zorder=4)
-        ax_price.text(i, y[i], f"{t}\n{sc:.2f}", fontsize=8, ha="center", va="bottom", color=col)
-
-def _ensure_size(buf_png: bytes, target_kb: int = 150, to_format: str = "auto") -> Tuple[bytes, str]:
-    kb = len(buf_png) / 1024
-    if kb <= target_kb and to_format not in ("jpg", "jpeg"):
-        return buf_png, "png"
-    im = Image.open(io.BytesIO(buf_png)).convert("RGB")
-    lo, hi, best = 35, 95, None
-    while lo <= hi:
-        q = (lo + hi) // 2
-        tmp = io.BytesIO()
-        im.save(tmp, format="JPEG", quality=int(q), optimize=True)
-        size_kb = tmp.tell() / 1024
-        if size_kb <= target_kb:
-            best = tmp.getvalue(); lo = q + 1
-        else:
-            hi = q - 1
-    if best is None:
-        tmp = io.BytesIO(); im.save(tmp, format="JPEG", quality=35, optimize=True)
-        best = tmp.getvalue()
-    return best, "jpeg"
-
-# -------------------- FastAPI --------------------
-app = FastAPI(title=APP_NAME)
-
+# ====== Endpoints ======
 @app.get("/")
 def root():
-    return {"ok": True, "app": APP_NAME,
-            "routes": ["/price","/klines","/indicators","/chart","/scan",
-                       "/experience/log (POST)","/experience/recent (GET)",
-                       "/chat/log (POST)","/chat/recent (GET)",
-                       "/analysis/run (POST)","/analysis/recent (GET)",
-                       "/auto/analyze (GET)"]}
+    return {"ok": True}
 
-# 現價
 @app.get("/price")
 def get_price(
-    symbol: str = Query(..., example="XRP/USDT"),
+    symbol: str = Query(SYMBOL_DEFAULT, example="XRP/USDT"),
     precision: int = Query(4, ge=0, le=10),
-    source: Literal["ticker","orderbook"] = Query("ticker"),
-    adjust: Optional[bool] = Query(None),
-    tz: str = Query(DEFAULT_TZ)
+    source: str = Query("ticker", regex="^(ticker|book)$", description="ticker 或 book")
 ):
-    ex = make_exchange()
-    if adjust is not None:
-        ex.options["adjustForTimeDifference"] = bool(adjust)
-    if source == "orderbook":
-        ob = ex.fetch_order_book(symbol, limit=5)
-        best_bid = ob["bids"][0][0] if ob["bids"] else None
-        best_ask = ob["asks"][0][0] if ob["asks"] else None
-        if best_bid is None or best_ask is None:
-            raise HTTPException(502, "Empty orderbook.")
-        price = (best_bid + best_ask) / 2.0
-        ts_ms = int(time.time() * 1000)
+    ex = binance()
+
+    if source == "book":
+        ob = ex.fetch_order_book(symbol)
+        if not ob["bids"] or not ob["asks"]:
+            raise HTTPException(503, "orderbook not ready")
+        price = (ob["bids"][0][0] + ob["asks"][0][0]) / 2
     else:
-        t = ex.fetch_ticker(symbol); price = t["last"]; ts_ms = int(t["timestamp"] or time.time()*1000)
-    return {"exchange":"binance","symbol":symbol,"price":round_price(float(price),precision),
-            "ts":ts_ms,"time_local":local_ts_str(ts_ms, tz)}
+        t = ex.fetch_ticker(symbol)
+        price = t["last"] or t["close"] or t["bid"] or t["ask"]
 
-# K 線
+    price = float(f"{price:.{precision}f}")
+    ts = int(time.time() * 1000)
+    return {
+        "exchange": "binance",
+        "symbol": symbol,
+        "price": price,
+        "ts": ts,
+        "time_local": local_str(ts),
+        "precision": precision
+    }
+
 @app.get("/klines")
-def get_klines(symbol: str = Query(...), interval: str = Query("15m"), limit: int = Query(200, ge=50, le=1000)):
-    df = fetch_ohlcv_df(symbol, interval, limit)
-    rows = [{"ts":int(r.ts),"open":float(r.open),"high":float(r.high),"low":float(r.low),
-             "close":float(r.close),"volume":float(r.volume)} for r in df.itertuples(index=False)]
-    return {"exchange":"binance","symbol":symbol,"interval":interval,"rows":rows}
+def get_klines(
+    symbol: str = Query(SYMBOL_DEFAULT),
+    interval: str = Query("15m", regex="^(5m|15m|30m|1h|4h|1d)$"),
+    limit: int = Query(200, ge=50, le=500)
+):
+    df = fetch_klines(symbol, interval, limit)
+    rows = df.to_dict(orient="records")
+    return {"exchange": "binance", "symbol": symbol, "interval": interval, "rows": rows}
 
-# 指標
 @app.get("/indicators")
 def get_indicators(
-    symbol: str = Query(...), interval: str = Query("15m"), limit: int = Query(200, ge=50, le=1000),
-    bbands: str = Query("20,2"), show_kdj: bool = Query(True), show_macd: bool = Query(True)
+    symbol: str = Query(SYMBOL_DEFAULT),
+    interval: str = Query("15m", regex="^(5m|15m|30m|1h|4h|1d)$"),
+    limit: int = Query(200, ge=50, le=500)
 ):
-    df = fetch_ohlcv_df(symbol, interval, limit)
-    close = df["close"].to_numpy(float); high = df["high"].to_numpy(float); low = df["low"].to_numpy(float)
-    try:
-        n_s,s_s = bbands.split(","); n, s = int(n_s), float(s_s)
-    except Exception:
-        raise HTTPException(400, "bbands must be 'period,sigma', e.g., 20,2")
-    up, mid, lo = calc_bbands(close, n=n, sigma=s)
-    out: Dict[str,Any] = {
-        "exchange":"binance","symbol":symbol,"interval":interval,
-        "last":{"open":float(df["open"].iloc[-1]),"high":float(df["high"].iloc[-1]),
-                "low":float(df["low"].iloc[-1]),"close":float(df["close"].iloc[-1]),
-                "volume":float(df["volume"].iloc[-1])},
-        "bbands":{"upper":float(up[-1]),"middle":float(mid[-1]),"lower":float(lo[-1]),"sigma":s}
+    df = fetch_klines(symbol, interval, limit)
+    close = df["close"]
+    k, d, j = calc_kdj(df, 9)
+    dif, dea, hist = calc_macd(close, 12, 26, 9)
+    ma, upper, lower = calc_bbands(close, 20, 2.0)
+
+    last = {
+        "ts": int(df["ts"].iloc[-1]),
+        "open": round4(df["open"].iloc[-1]),
+        "high": round4(df["high"].iloc[-1]),
+        "low": round4(df["low"].iloc[-1]),
+        "close": round4(df["close"].iloc[-1]),
+        "volume": float(df["volume"].iloc[-1])
     }
-    if show_kdj:
-        k,d,j = calc_kdj(high, low, close); out["kdj"]={"k":float(k[-1]),"d":float(d[-1]),"j":float(j[-1])}
-    if show_macd:
-        dif,dea,hist = calc_macd(close); out["macd"]={"dif":float(dif[-1]),"dea":float(dea[-1]),"hist":float(hist[-1]),
-                                                      "fast":12,"slow":26,"signal":9}
+    out = {
+        "exchange": "binance",
+        "symbol": symbol,
+        "interval": interval,
+        "last": last,
+        "bbands": {
+            "upper": round4(upper.iloc[-1]),
+            "middle": round4(ma.iloc[-1]),
+            "lower": round4(lower.iloc[-1]),
+            "sigma": 2
+        },
+        "kdj": {
+            "k": float(f"{k.iloc[-1]:.2f}"),
+            "d": float(f"{d.iloc[-1]:.2f}"),
+            "j": float(f"{j.iloc[-1]:.2f}")
+        },
+        "macd": {
+            "dif": float(f"{dif.iloc[-1]:.4f}"),
+            "dea": float(f"{dea.iloc[-1]:.4f}"),
+            "hist": float(f"{hist.iloc[-1]:.4f}")
+        }
+    }
     return out
 
-# 圖（含圖片壓縮到 ~150KB）
 @app.get("/chart")
 def get_chart(
-    symbol: str = Query(...), interval: str = Query("15m"), limit: int = Query(300, ge=100, le=1000),
-    sma20: Optional[int] = Query(20), bbands: Optional[int] = Query(20), bb_sigma: float = Query(2.0),
-    show_kdj: bool = Query(True), show_macd: bool = Query(True), volume: bool = Query(True),
-    annotate: bool = Query(True), strict: bool = Query(False),
-    max_kb: int = Query(150, ge=60, le=600), img_format: Literal["auto","png","jpg","jpeg"] = Query("auto"),
-    width: float = Query(10.0), height: float = Query(5.0), dpi: int = Query(120, ge=70, le=200)
+    symbol: str = Query(SYMBOL_DEFAULT),
+    interval: str = Query("15m", regex="^(5m|15m|30m|1h|4h|1d)$"),
+    limit: int = Query(300, ge=100, le=500),
+    sma: int = Query(20, ge=2, le=200),
+    bbands: int = Query(20, ge=5, le=100),
+    show_kdj: bool = Query(True),
+    show_macd: bool = Query(True),
+    volume: bool = Query(True)
 ):
-    df = fetch_ohlcv_df(symbol, interval, limit)
-    # 佈局比例
-    h_price = 0.62; h_vol = 0.12 if volume else 0.0; h_kdj = 0.13 if show_kdj else 0.0; h_macd = 0.13 if show_macd else 0.0
-    n_axes = 1 + int(volume) + int(show_kdj) + int(show_macd)
-    ratios = [h_price] + ([h_vol] if volume else []) + ([h_kdj] if show_kdj else []) + ([h_macd] if show_macd else [])
-    fig, axes = plt.subplots(nrows=n_axes, ncols=1, figsize=(width, height),
-                             gridspec_kw={"height_ratios": ratios if ratios else [1.0]})
-    if not isinstance(axes, np.ndarray): axes = np.array([axes])
-    idx=0; ax_price = axes[idx]; idx+=1
-    # 蠟燭
-    draw_candles(ax_price, df); ax_price.set_title(f"{symbol}  {interval}")
-    # SMA/BB
-    if sma20:
-        ax_price.plot(sma(df["close"].to_numpy(float), sma20), linewidth=1.05, color="#34495e", label=f"SMA{sma20}")
-    if bbands:
-        up, mid, lo = calc_bbands(df["close"].to_numpy(float), n=bbands, sigma=bb_sigma)
-        ax_price.plot(up,linewidth=0.9,color="#8e44ad"); ax_price.plot(mid,linewidth=0.9,color="#8e44ad",linestyle="--"); ax_price.plot(lo,linewidth=0.9,color="#8e44ad")
-    # 成交量
+    df = fetch_klines(symbol, interval, limit)
+    close = df["close"]
+    ma20 = close.rolling(20).mean()
+    ma50 = close.rolling(50).mean()
+    ma, upper, lower = calc_bbands(close, bbands, 2.0)
+
+    k, d, j = calc_kdj(df, 9)
+    dif, dea, hist = calc_macd(close, 12, 26, 9)
+
+    # figure 佈局：上面主圖；下面兩圖（可選）
+    rows = 1 + int(show_kdj) + int(show_macd)
+    height = 2.8 * rows
+    fig, axes = plt.subplots(rows, 1, figsize=(10, height), sharex=True,
+                             gridspec_kw={"height_ratios": [2] + [1]*(rows-1)})
+
+    if rows == 1:
+        ax = axes
+        sub_axes = []
+    else:
+        ax = axes[0]
+        sub_axes = axes[1:]
+
+    x = np.arange(len(df))
+    # K 線（以蠟燭條顯示）
+    up = df["close"] >= df["open"]
+    down = ~up
+    # 上漲
+    ax.bar(x[up], (df["close"] - df["open"])[up], bottom=df["open"][up], color="#26a69a", width=0.6)
+    ax.vlines(x[up], df["low"][up], df["high"][up], color="#26a69a", linewidth=1)
+    # 下跌
+    ax.bar(x[down], (df["close"] - df["open"])[down], bottom=df["open"][down], color="#ef5350", width=0.6)
+    ax.vlines(x[down], df["low"][down], df["high"][down], color="#ef5350", linewidth=1)
+
+    # SMA 與 BB
+    ax.plot(x, ma20, linewidth=1, label="SMA20")
+    ax.plot(x, ma50, linewidth=1, label="SMA50")
+    ax.plot(x, upper, linewidth=1, linestyle="--", label="BB upper")
+    ax.plot(x, ma, linewidth=1, linestyle="--", label="BB mid")
+    ax.plot(x, lower, linewidth=1, linestyle="--", label="BB lower")
+
     if volume:
-        ax_vol = axes[idx]; idx+=1
-        opens = df["open"].to_numpy(float); closes=df["close"].to_numpy(float)
-        colors = np.where(closes>=opens, "#e74c3c", "#2ecc71")
-        ax_vol.bar(np.arange(len(df)), df["volume"].to_numpy(float), color=colors, width=0.7)
-        ax_vol.set_xlim(0,len(df)-1); ax_vol.set_ylabel("Vol")
-    # KDJ
-    if show_kdj:
-        ax_kdj=axes[idx]; idx+=1
-        k,d,j = calc_kdj(df["high"].to_numpy(float), df["low"].to_numpy(float), df["close"].to_numpy(float))
-        ax_kdj.plot(k,label="K"); ax_kdj.plot(d,label="D"); ax_kdj.plot(j,label="J")
-        ax_kdj.axhline(80,color="#7f8c8d",linewidth=0.8,linestyle="--"); ax_kdj.axhline(20,color="#7f8c8d",linewidth=0.8,linestyle="--")
-        ax_kdj.legend(loc="upper left",fontsize=8)
-    # MACD
-    if show_macd:
-        ax_macd=axes[idx]; idx+=1
-        dif,dea,hist=calc_macd(df["close"].to_numpy(float))
-        ax_macd.plot(dif,label="DIF"); ax_macd.plot(dea,label="DEA")
-        colors=np.where(hist>=0,"#e74c3c","#2ecc71")
-        ax_macd.bar(np.arange(len(hist)), hist, color=colors, width=0.7, alpha=0.6, label="HIST")
-        ax_macd.legend(loc="upper left",fontsize=8)
-    # 標註型態
-    if annotate:
-        dets = scan_patterns_df(df, strict=strict)
-        annotate_patterns(ax_price, dets, df)
+        vol_ax = ax.twinx()
+        vol_ax.bar(x, df["volume"], alpha=0.2, width=0.6, color="#90caf9")
+        vol_ax.set_yticklabels([])
+
+    ax.set_title(f"{symbol}  {interval}  ({limit} bars)")
+    ax.legend(loc="upper left")
+    ax.grid(alpha=0.2)
+
+    idx = 0
+    if show_kdj and idx < len(sub_axes):
+        ax2 = sub_axes[idx]; idx += 1
+        ax2.plot(x, k, label="K")
+        ax2.plot(x, d, label="D")
+        ax2.plot(x, j, label="J")
+        ax2.legend(loc="upper left"); ax2.grid(alpha=0.2)
+
+    if show_macd and idx < len(sub_axes):
+        ax3 = sub_axes[idx]; idx += 1
+        ax3.plot(x, dif, label="DIF")
+        ax3.plot(x, dea, label="DEA")
+        ax3.bar(x, hist, label="HIST", color=np.where(hist >= 0, "#26a69a", "#ef5350"), alpha=0.4)
+        ax3.legend(loc="upper left"); ax3.grid(alpha=0.2)
+
     plt.tight_layout()
-    buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=dpi); plt.close(fig)
-    png_bytes = buf.getvalue()
-    if img_format=="png" and len(png_bytes)/1024 <= max_kb:
-        return Response(content=png_bytes, media_type="image/png")
-    out_bytes, sub = _ensure_size(png_bytes, target_kb=max_kb, to_format=img_format)
-    return Response(content=out_bytes, media_type=f"image/{sub}")
+    data = save_png_under(fig, target_kb=150)
+    plt.close(fig)
+    return StreamingResponse(io.BytesIO(data), media_type="image/png")
 
-# 型態掃描（JSON）
-@app.get("/scan")
-def scan_endpoint(symbol: str = Query(...), interval: str = Query("15m"), limit: int = Query(200, ge=50, le=1000), strict: bool = Query(False)):
-    df = fetch_ohlcv_df(symbol, interval, limit)
-    dets = scan_patterns_df(df, strict=strict)
-    return {"exchange":"binance","symbol":symbol,"interval":interval,"detections":dets}
-
-# 經驗紀錄（DB）
+# ===== 經驗紀錄 =====
 @app.post("/experience/log")
-def post_experience_log(
-    symbol: str = Body(...), interval: str = Body(...), pattern: str = Body(...), outcome: str = Body(...), notes: str = Body("")
-, db: Session = Depends(get_db)):
-    ts_ms = int(time.time()*1000)
-    row = ExperienceLog(ts_ms=ts_ms, symbol=symbol, interval=interval, pattern=pattern, outcome=outcome, notes=notes)
-    db.add(row); db.commit()
-    return {"ok": True, "saved": {"id": row.id, "ts": ts_ms}}
+def post_experience(payload: Dict[str, Any]):
+    """
+    {
+      "symbol": "XRP/USDT",
+      "interval": "15m",
+      "pattern": "three_white_soldiers",
+      "outcome": "bullish",
+      "notes": "收斂箱體突破後..."
+    }
+    """
+    symbol = payload.get("symbol", SYMBOL_DEFAULT)
+    interval = payload.get("interval", "15m")
+    pattern = payload.get("pattern", "")
+    outcome = payload.get("outcome", "")
+    notes = payload.get("notes", "")
+
+    ts = int(time.time() * 1000)
+    db_insert(ts, symbol, interval, pattern, outcome, notes)
+    return {"ok": True, "saved": True, "ts": ts, "time_local": local_str(ts)}
 
 @app.get("/experience/recent")
-def get_experience_recent(limit: int = Query(20, ge=1, le=200), symbol: Optional[str] = Query(None), interval: Optional[str] = Query(None), db: Session = Depends(get_db)):
-    q = db.query(ExperienceLog).order_by(desc(ExperienceLog.id))
-    if symbol:  q = q.filter(ExperienceLog.symbol==symbol)
-    if interval:q = q.filter(ExperienceLog.interval==interval)
-    rows = q.limit(limit).all()
-    return {"items":[{"id":r.id,"ts":r.ts_ms,"symbol":r.symbol,"interval":r.interval,"pattern":r.pattern,"outcome":r.outcome,"notes":r.notes} for r in rows]}
+def get_experience_recent(n: int = Query(20, ge=1, le=200)):
+    rows = db_recent(n)
+    return {"ok": True, "items": rows}
 
-# 聊天紀錄（DB）
-@app.post("/chat/log")
-def post_chat_log(
-    role: Literal["user","assistant","system"] = Body("user"),
-    content: str = Body(...),
-    symbol: Optional[str] = Body(None),
-    interval: Optional[str] = Body(None),
-    tags: Optional[List[str]] = Body(default=None),
-    db: Session = Depends(get_db)
-):
-    ts_ms = int(time.time()*1000)
-    row = ChatLog(ts_ms=ts_ms, role=role, content=content, symbol=symbol, interval=interval, tags=json.dumps(tags or []))
-    db.add(row); db.commit()
-    return {"ok": True, "saved": {"id": row.id, "ts": ts_ms}}
+# ===== 可選：每 15 分鐘自動分析（預設關閉）。設環境變數 AUTO_ANALYZE=true 啟用 =====
+_auto_started = False
 
-@app.get("/chat/recent")
-def get_chat_recent(limit: int = Query(50, ge=1, le=500), symbol: Optional[str] = Query(None), interval: Optional[str] = Query(None), role: Optional[Literal["user","assistant","system"]] = Query(None), db: Session = Depends(get_db)):
-    q = db.query(ChatLog).order_by(desc(ChatLog.id))
-    if symbol:   q = q.filter(ChatLog.symbol==symbol)
-    if interval: q = q.filter(ChatLog.interval==interval)
-    if role:     q = q.filter(ChatLog.role==role)
-    rows = q.limit(limit).all()
-    return {"items":[{"id":r.id,"ts":r.ts_ms,"role":r.role,"content":r.content,"symbol":r.symbol,"interval":r.interval,"tags":json.loads(r.tags or "[]")} for r in rows]}
+def _auto_worker():
+    while True:
+        try:
+            df = fetch_klines(SYMBOL_DEFAULT, "15m", 120)
+            # 簡單範例：連續 3 根紅棒（three white soldiers）偵測
+            closes = df["close"].values
+            opens = df["open"].values
+            cond = (closes[-1] > opens[-1]) and (closes[-2] > opens[-2]) and (closes[-3] > opens[-3]) \
+                   and (closes[-1] > closes[-2] > closes[-3])
+            if cond:
+                db_insert(int(time.time()*1000), SYMBOL_DEFAULT, "15m", "three_white_soldiers", "bullish", "auto")
+        except Exception as e:
+            print("[auto] error:", e)
+        # 15 分鐘跑一次
+        time.sleep(900)
 
-# ---- 分析與自動存檔 ----
-def _analyze_one(df: pd.DataFrame) -> Dict[str, Any]:
-    close = df["close"].to_numpy(float); high = df["high"].to_numpy(float); low = df["low"].to_numpy(float)
-    k,d,j = calc_kdj(high, low, close); dif,dea,hist = calc_macd(close)
-    up, mid, lo = calc_bbands(close, n=20, sigma=2.0)
-    # 位置判斷
-    pos = "below_lower" if close[-1] < lo[-1] else ("above_upper" if close[-1] > up[-1] else "in_band")
-    # 交叉
-    kdj_cross = "golden" if (k[-2] <= d[-2] and k[-1] > d[-1]) else ("dead" if (k[-2] >= d[-2] and k[-1] < d[-1]) else "none")
-    macd_cross = "golden" if (dif[-2] <= dea[-2] and dif[-1] > dea[-1]) else ("dead" if (dif[-2] >= dea[-2] and dif[-1] < dea[-1]) else "none")
-    # 型態（近 3 根）
-    dets = scan_patterns_df(df.tail(60).reset_index(drop=True), strict=False)
-    return {
-        "last":{"open":float(df["open"].iloc[-1]),"high":float(df["high"].iloc[-1]),"low":float(df["low"].iloc[-1]),"close":float(close[-1]),"volume":float(df["volume"].iloc[-1])},
-        "bbands":{"upper":float(up[-1]),"middle":float(mid[-1]),"lower":float(lo[-1]),"pos":pos},
-        "kdj":{"k":float(k[-1]),"d":float(d[-1]),"j":float(j[-1]),"cross":kdj_cross},
-        "macd":{"dif":float(dif[-1]),"dea":float(dea[-1]),"hist":float(hist[-1]),"cross":macd_cross},
-        "patterns": dets[:10]
-    }
+def maybe_start_auto():
+    global _auto_started
+    if _auto_started:
+        return
+    if os.getenv("AUTO_ANALYZE", "false").lower() == "true":
+        t = threading.Thread(target=_auto_worker, daemon=True)
+        t.start()
+        _auto_started = True
 
-def _delta(prev: Dict[str,Any], cur: Dict[str,Any]) -> Dict[str,Any]:
-    out={}
-    try:
-        out["close_change"] = round(float(cur["last"]["close"] - prev["last"]["close"]), 6)
-        out["kdj_cross_change"] = f'{prev["kdj"]["cross"]} -> {cur["kdj"]["cross"]}'
-        out["macd_cross_change"]= f'{prev["macd"]["cross"]} -> {cur["macd"]["cross"]}'
-        out["bb_pos_change"]    = f'{prev["bbands"]["pos"]} -> {cur["bbands"]["pos"]}'
-    except Exception:
-        pass
-    return out
-
-@app.post("/analysis/run")
-def analysis_run(
-    symbol: str = Body("XRP/USDT"),
-    intervals: List[str] = Body(["15m","30m","1h","4h","1d"]),
-    limit: int = Body(200),
-    save: bool = Body(True),
-    compare_prev: bool = Body(True),
-    db: Session = Depends(get_db)
-):
-    results=[]; ts_ms = int(time.time()*1000)
-    for interval in intervals:
-        df = fetch_ohlcv_df(symbol, interval, limit)
-        cur = _analyze_one(df)
-
-        delta = {}
-        if compare_prev:
-            prev_row = db.query(AnalysisLog).filter(AnalysisLog.symbol==symbol, AnalysisLog.interval==interval).order_by(desc(AnalysisLog.id)).first()
-            if prev_row:
-                prev = json.loads(prev_row.result_json)
-                delta = _delta(prev, cur)
-
-        summary = f"{symbol} {interval}: close={cur['last']['close']:.4f}, BB={cur['bbands']['pos']}, KDJ={cur['kdj']['cross']}, MACD={cur['macd']['cross']}"
-        results.append({"symbol":symbol,"interval":interval,"ts":ts_ms,"result":cur,"delta":delta,"summary":summary})
-
-        if save:
-            row = AnalysisLog(ts_ms=ts_ms, symbol=symbol, interval=interval,
-                              result_json=json.dumps(cur, ensure_ascii=False),
-                              delta_json=json.dumps(delta, ensure_ascii=False),
-                              summary=summary)
-            db.add(row)
-    if save:
-        db.commit()
-    return {"ok": True, "items": results}
-
-@app.get("/analysis/recent")
-def analysis_recent(symbol: str = Query("XRP/USDT"), interval: Optional[str] = Query(None), limit: int = Query(10, ge=1, le=100), db: Session = Depends(get_db)):
-    q = db.query(AnalysisLog).filter(AnalysisLog.symbol==symbol)
-    if interval: q = q.filter(AnalysisLog.interval==interval)
-    rows = q.order_by(desc(AnalysisLog.id)).limit(limit).all()
-    return {"items":[{"id":r.id,"ts":r.ts_ms,"symbol":r.symbol,"interval":r.interval,"summary":r.summary,"result":json.loads(r.result_json),"delta":json.loads(r.delta_json or "{}")} for r in rows]}
-
-@app.get("/auto/analyze")
-def auto_analyze(symbol: str = Query("XRP/USDT"), interval: str = Query("15m"), token: Optional[str] = Query(None), db: Session = Depends(get_db)):
-    if CRON_SECRET and token != CRON_SECRET:
-        raise HTTPException(401, "Invalid token")
-    # 跑單框架，儲存並比對
-    payload = {"symbol":symbol, "intervals":[interval], "limit":200, "save":True, "compare_prev":True}
-    # 直接呼叫內部函式
-    return analysis_run(symbol=symbol, intervals=[interval], limit=200, save=True, compare_prev=True, db=db)
-
-# 本機啟動
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+maybe_start_auto()

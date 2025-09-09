@@ -1,9 +1,0 @@
-fastapi
-uvicorn
-ccxt
-pandas
-numpy
-matplotlib
-pillow
-sqlalchemy
-psycopg2-binary
