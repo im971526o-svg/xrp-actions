@@ -1,8 +1,6 @@
-fastapi
-uvicorn
-ccxt
-pandas
-numpy
-matplotlib
-mplfinance==0.12.9b7   # 若裝不上可改 0.12.10b0 或不鎖版
-pillow                 # 讓 matplotlib 能輸出 PNG
+fastapi>=0.111
+uvicorn[standard]>=0.30
+ccxt>=4.2
+pandas>=2.2
+numpy>=1.26
+matplotlib>=3.8

@@ -1,396 +1,380 @@
-# ── 必須在 pyplot 之前設定無頭後端 ─────────────────────────────────────────────
-import matplotlib
-matplotlib.use("Agg")  # 讓伺服器無圖形介面也能畫圖
-
-# ── 標準匯入 ────────────────────────────────────────────────────────────────
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
+# app/main.py
+# =========================================================
+# XRP Pattern Scanner Actions - Full API
+# Endpoints:
+#   GET /           : health
+#   GET /price      : 現價（預設用買賣一中間價），回傳 time_local=「上午/下午 HH 點 mm 分」
+#   GET /klines     : 取得 OHLCV
+#   GET /indicators : BB(20,2) / KDJ(9,3,3) / MACD(12,26,9)
+#   GET /chart      : 圖表（PNG），可開關：BB、KDJ、MACD、成交量（volume）
+#   POST /experience/log, GET /experience/recent : 簡易經驗紀錄（示範用、存在記憶體）
+# =========================================================
+from fastapi import FastAPI, Query, HTTPException, Body
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
-from typing import List, Optional, Literal
-import ccxt
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import mplfinance as mpf
+from typing import List, Dict, Any, Optional
 from io import BytesIO
-import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+import ccxt
+
+import matplotlib
+matplotlib.use("Agg")  # 重要：Render 無視窗環境要用 Agg
+import matplotlib.pyplot as plt
 
 APP_NAME = "XRP Pattern Scanner Actions"
 
-app = FastAPI(title=APP_NAME)
+# ---------------------------
+# 初始化交易所（Binance Spot）
+# ---------------------------
+binance = ccxt.binance({
+    "enableRateLimit": True,
+    "options": {
+        "defaultType": "spot",
+        "adjustForTimeDifference": True,
+    }
+})
+binance.load_markets()
 
-# ── 交易所初始化（幣安 / 四位小數一致化）───────────────────────────────────────
-def _ex_binance():
-    ex = ccxt.binance({
-        "enableRateLimit": True,
-        "options": {
-            "defaultType": "spot",
-            "adjustForTimeDifference": False,  # 關閉時間差校正，較穩
-        },
-    })
-    if "adjustForTimeDifference" not in ex.options:
-        ex.options["adjustForTimeDifference"] = False
-    return ex
+# 支援的時間框架（ccxt 對應）
+ALLOWED_INTERVALS = {"5m", "15m", "30m", "1h", "4h", "1d"}
+
+# ---------------------------
+# 小工具
+# ---------------------------
+def to_local_str(ts_ms: int, tz: str = "Asia/Taipei") -> str:
+    dt = datetime.fromtimestamp(ts_ms / 1000, ZoneInfo(tz))
+    ampm = "上午" if dt.hour < 12 else "下午"
+    hh = dt.hour if dt.hour <= 12 else dt.hour - 12
+    if hh == 0:
+        hh = 12
+    return f"{ampm} {hh:02d} 點 {dt.minute:02d} 分"
 
 def r4(x: float) -> float:
-    """四位小數"""
-    return float(f"{float(x):.4f}")
+    return float(f"{x:.4f}")
 
-ALLOWED_INTERVALS = {"15m", "1h", "4h", "1d"}
+def fetch_price(symbol: str, source: str = "book", precision: int = 4) -> Dict[str, Any]:
+    """
+    source='book'   : 取 orderbook 買一/賣一中間價（較貼近即時）
+    source='ticker' : 取上一筆成交價（last），沒有就 bid/ask 中間
+    """
+    if source == "book":
+        ob = binance.fetch_order_book(symbol, 5)
+        bid = ob["bids"][0][0] if ob["bids"] else None
+        ask = ob["asks"][0][0] if ob["asks"] else None
+        if bid is None or ask is None:
+            t = binance.fetch_ticker(symbol)
+            last = t.get("last")
+            bid = t.get("bid")
+            ask = t.get("ask")
+            price = last or ((bid or 0) + (ask or 0)) / 2
+            ts = t.get("timestamp") or binance.milliseconds()
+        else:
+            price = (bid + ask) / 2
+            ts = ob.get("timestamp") or binance.milliseconds()
+    else:
+        t = binance.fetch_ticker(symbol)
+        last = t.get("last")
+        bid = t.get("bid")
+        ask = t.get("ask")
+        price = last or ((bid or 0) + (ask or 0)) / 2
+        ts = t.get("timestamp") or binance.milliseconds()
 
-# ── 共同資料處理 ─────────────────────────────────────────────────────────────
-def fetch_ohlcv_df(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    if precision is not None:
+        price = float(f"{price:.{precision}f}")
+    else:
+        price = r4(price)
+
+    return {
+        "exchange": "binance",
+        "symbol": symbol,
+        "price": price,
+        "ts": ts,
+        "time_local": to_local_str(ts),
+    }
+
+def fetch_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     if interval not in ALLOWED_INTERVALS:
-        raise HTTPException(400, f"interval must be one of {sorted(ALLOWED_INTERVALS)}")
-    if limit < 10 or limit > 1000:
-        raise HTTPException(400, "limit must be between 10 and 1000")
+        raise HTTPException(status_code=400, detail=f"interval 必須為 {sorted(ALLOWED_INTERVALS)}")
+    if limit > 1000:
+        raise HTTPException(status_code=400, detail="limit 最多 1000")
 
-    ex = _ex_binance()
-    try:
-        rows = ex.fetch_ohlcv(symbol, timeframe=interval, limit=limit)
-    except Exception as e:
-        raise HTTPException(502, f"failed to fetch_ohlcv: {e}")
-
-    if not rows:
-        raise HTTPException(404, "no klines")
-
-    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    # 四位小數（量能保留原值）
-    for c in ["open", "high", "low", "close"]:
-        df[c] = df[c].astype(float).map(r4)
-    df.set_index("ts", inplace=True)
+    raw = binance.fetch_ohlcv(symbol, timeframe=interval, limit=limit)
+    # raw: [ts, open, high, low, close, volume]
+    df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
     return df
 
-def parse_int_list(csv: str) -> List[int]:
-    return [int(x) for x in csv.split(",") if str(x).strip().isdigit()]
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
 
-# ── 指標（BB、KDJ、MACD）────────────────────────────────────────────────────
-def compute_bbands(df: pd.DataFrame, period: int = 20, sigma: float = 2.0) -> pd.DataFrame:
-    mid = df["close"].rolling(period, min_periods=period).mean()
-    std = df["close"].rolling(period, min_periods=period).std(ddof=0)
-    upper = mid + sigma * std
-    lower = mid - sigma * std
-    out = pd.DataFrame({
-        "bb_mid": mid.map(r4),
-        "bb_upper": upper.map(r4),
-        "bb_lower": lower.map(r4),
-    }, index=df.index)
-    return out
+def indicators(df: pd.DataFrame) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    if len(df) == 0:
+        return out
 
-def compute_kdj(df: pd.DataFrame, n: int = 9, m1: int = 3, m2: int = 3) -> pd.DataFrame:
-    low_n = df["low"].rolling(n, min_periods=n).min()
-    high_n = df["high"].rolling(n, min_periods=n).max()
-    rsv = (df["close"] - low_n) / (high_n - low_n) * 100.0
-    k = rsv.ewm(alpha=1/m1, adjust=False).mean()
-    d = k.ewm(alpha=1/m2, adjust=False).mean()
-    j = 3*k - 2*d
-    return pd.DataFrame({"K": k.map(r4), "D": d.map(r4), "J": j.map(r4)}, index=df.index)
-
-def compute_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
-    ema_fast = df["close"].ewm(span=fast, adjust=False).mean()
-    ema_slow = df["close"].ewm(span=slow, adjust=False).mean()
-    dif = ema_fast - ema_slow
-    dea = dif.ewm(span=signal, adjust=False).mean()
-    hist = (dif - dea) * 2
-    return pd.DataFrame({
-        "DIF": dif.map(r4),
-        "DEA": dea.map(r4),
-        "HIST": hist.map(r4)
-    }, index=df.index)
-
-# ── 回應模型（可選，讓 /docs 更清楚）──────────────────────────────────────────
-class PriceResponse(BaseModel):
-    exchange: str
-    symbol: str
-    price: float
-    ts: int
-
-class KlineRow(BaseModel):
-    ts: int
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
-
-class KlinesResponse(BaseModel):
-    exchange: str
-    symbol: str
-    interval: str
-    rows: List[KlineRow]
-
-class IndicatorsResponse(BaseModel):
-    exchange: str
-    symbol: str
-    interval: str
-    last: dict
-
-# ── Endpoints ───────────────────────────────────────────────────────────────
-@app.get("/price", response_model=PriceResponse)
-def price(symbol: str = "XRP/USDT"):
-    ex = _ex_binance()
-    try:
-        ticker = ex.fetch_ticker(symbol)
-    except Exception as e:
-        raise HTTPException(502, f"failed to fetch_ticker: {e}")
-    last = r4(ticker.get("last") or ticker.get("close") or 0.0)
-    return {
-        "exchange": "binance",
-        "symbol": symbol,
-        "price": last,
-        "ts": int(time.time()*1000),
-    }
-
-@app.get("/klines", response_model=KlinesResponse)
-def klines(
-    symbol: str = "XRP/USDT",
-    interval: Literal["15m", "1h", "4h", "1d"] = "15m",
-    limit: int = Query(200, ge=10, le=1000),
-):
-    df = fetch_ohlcv_df(symbol, interval, limit)
-    rows = [
-        KlineRow(
-            ts=int(idx.value/1e6),
-            open=r4(row.open), high=r4(row.high),
-            low=r4(row.low), close=r4(row.close),
-            volume=float(row.volume),
-        )
-        for idx, row in df.iterrows()
-    ]
-    return {
-        "exchange": "binance",
-        "symbol": symbol,
-        "interval": interval,
-        "rows": rows,
-    }
-
-@app.get("/indicators", response_model=IndicatorsResponse)
-def indicators(
-    symbol: str = "XRP/USDT",
-    interval: Literal["15m", "1h", "4h", "1d"] = "15m",
-    limit: int = Query(200, ge=50, le=1000),
-):
-    df = fetch_ohlcv_df(symbol, interval, limit)
-    bb = compute_bbands(df, period=20, sigma=2.0)
-    kdj = compute_kdj(df, n=9, m1=3, m2=3)
-    macd = compute_macd(df, fast=12, slow=26, signal=9)
-
-    last_ts = df.index[-1]
-    out = {
-        "exchange": "binance",
-        "symbol": symbol,
-        "interval": interval,
-        "last": {
-            "ts": int(last_ts.value/1e6),
-            "open": r4(df["open"].iloc[-1]),
-            "high": r4(df["high"].iloc[-1]),
-            "low": r4(df["low"].iloc[-1]),
-            "close": r4(df["close"].iloc[-1]),
-            "volume": float(df["volume"].iloc[-1]),
-            "bbands": {
-                "upper": r4(bb["bb_upper"].iloc[-1]),
-                "middle": r4(bb["bb_mid"].iloc[-1]),
-                "lower": r4(bb["bb_lower"].iloc[-1]),
-                "sigma": 2,
-            },
-            "kdj": {
-                "k": r4(kdj["K"].iloc[-1]),
-                "d": r4(kdj["D"].iloc[-1]),
-                "j": r4(kdj["J"].iloc[-1]),
-                "n": 9, "m1": 3, "m2": 3,
-            },
-            "macd": {
-                "dif": r4(macd["DIF"].iloc[-1]),
-                "dea": r4(macd["DEA"].iloc[-1]),
-                "hist": r4(macd["HIST"].iloc[-1]),
-                "fast": 12, "slow": 26, "signal": 9,
-            },
+    # BB(20,2)
+    if len(df) >= 20:
+        mid = df["close"].rolling(20).mean()
+        std = df["close"].rolling(20).std(ddof=0)
+        upper = mid + 2 * std
+        lower = mid - 2 * std
+        out["bbands"] = {
+            "upper": r4(upper.iloc[-1]),
+            "middle": r4(mid.iloc[-1]),
+            "lower": r4(lower.iloc[-1]),
+            "sigma": 2,
         }
+
+    # KDJ(9,3,3)
+    if len(df) >= 9:
+        low_n = df["low"].rolling(9).min()
+        high_n = df["high"].rolling(9).max()
+        rsv = (df["close"] - low_n) / (high_n - low_n) * 100
+        k = rsv.ewm(alpha=1/3, adjust=False).mean()
+        d = k.ewm(alpha=1/3, adjust=False).mean()
+        j = 3 * k - 2 * d
+        out["kdj"] = {
+            "k": r4(float(k.iloc[-1])),
+            "d": r4(float(d.iloc[-1])),
+            "j": r4(float(j.iloc[-1])),
+        }
+
+    # MACD(12,26,9)
+    if len(df) >= 26:
+        fast_ema = ema(df["close"], 12)
+        slow_ema = ema(df["close"], 26)
+        diff = fast_ema - slow_ema
+        dea = diff.ewm(span=9, adjust=False).mean()
+        hist = diff - dea
+        out["macd"] = {
+            "diff": r4(float(diff.iloc[-1])),
+            "dea": r4(float(dea.iloc[-1])),
+            "hist": r4(float(hist.iloc[-1])),
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+        }
+
+    # last candle
+    last = df.iloc[-1].to_dict()
+    last["open"] = r4(last["open"])
+    last["high"] = r4(last["high"])
+    last["low"] = r4(last["low"])
+    last["close"] = r4(last["close"])
+    last["volume"] = float(f"{last['volume']:.2f}")
+
+    out["last"] = {
+        "open": last["open"], "high": last["high"], "low": last["low"], "close": last["close"],
+        "volume": last["volume"], "ts": int(last["ts"])
     }
     return out
 
-@app.get("/chart")
-def chart(
-    symbol: str = "XRP/USDT",
-    interval: Literal["15m", "1h", "4h", "1d"] = "15m",
-    limit: int = Query(300, ge=50, le=1000),
-    sma: str = "20,50",
-    bbands: str = "20,2",
-    show_kdj: bool = True,
-    show_macd: bool = True,
-):
-    df = fetch_ohlcv_df(symbol, interval, limit)
+def make_chart(df: pd.DataFrame,
+               symbol: str,
+               interval: str,
+               limit: int,
+               sma20: int = 20,
+               sma50: int = 50,
+               bbands: int = 20,
+               show_kdj: bool = False,
+               show_macd: bool = False,
+               volume: bool = True) -> BytesIO:
+    """
+    為了避免安裝額外套件，這裡用「收盤線 + BB + SMA」，
+    下方可選擇 KDJ/MACD/成交量 子圖。
+    """
+    if len(df) < 5:
+        raise HTTPException(status_code=400, detail="資料不足，無法作圖")
 
-    # ── addplot 設定 ────────────────────────────────────────────────────────
-    aps = []
+    close = df["close"].copy()
+    idx = pd.to_datetime(df["ts"], unit="ms")
+
+    rows = 1
+    if show_kdj:
+        rows += 1
+    if show_macd:
+        rows += 1
+    if volume:
+        rows += 1
+
+    fig, axes = plt.subplots(rows, 1, figsize=(10, 6 + 1.5*rows), sharex=True)
+    if rows == 1:
+        axes = [axes]
+
+    ax_price = axes[0]
+    ax_price.plot(idx, close, label="Close", linewidth=1.2)
 
     # SMA
-    sma_periods = parse_int_list(sma)
-    for p in sma_periods:
-        sma_series = df["close"].rolling(p, min_periods=p).mean().map(r4)
-        aps.append(mpf.make_addplot(sma_series, panel=0, width=1.0))
+    if len(df) >= sma20:
+        ax_price.plot(idx, close.rolling(sma20).mean(), label=f"SMA{sma20}", linewidth=1)
+    if len(df) >= sma50:
+        ax_price.plot(idx, close.rolling(sma50).mean(), label=f"SMA{sma50}", linewidth=1)
 
-    # BBands
-    bb = parse_int_list(bbands)
-    if len(bb) >= 1:
-        bb_period = bb[0]
-        bb_sigma = float(bb[1]) if len(bb) >= 2 else 2.0
-        bbdf = compute_bbands(df, period=bb_period, sigma=bb_sigma)
-        aps.append(mpf.make_addplot(bbdf["bb_upper"], panel=0, width=0.8))
-        aps.append(mpf.make_addplot(bbdf["bb_lower"], panel=0, width=0.8))
+    # BB
+    if len(df) >= bbands:
+        mid = close.rolling(bbands).mean()
+        std = close.rolling(bbands).std(ddof=0)
+        up = mid + 2*std
+        lo = mid - 2*std
+        ax_price.plot(idx, up, linewidth=0.8, label=f"BB+2σ")
+        ax_price.plot(idx, mid, linewidth=0.8, label=f"BB mid")
+        ax_price.plot(idx, lo, linewidth=0.8, label=f"BB-2σ")
 
-    # KDJ panel
+    ax_price.set_title(f"{symbol} {interval} (n={limit})")
+    ax_price.legend(loc="upper left")
+
+    row_ptr = 1
+
+    # KDJ
     if show_kdj:
-        kdj = compute_kdj(df, n=9, m1=3, m2=3)
-        aps.append(mpf.make_addplot(kdj["K"], panel=1, width=0.8))
-        aps.append(mpf.make_addplot(kdj["D"], panel=1, width=0.8))
-        aps.append(mpf.make_addplot(kdj["J"], panel=1, width=0.8))
+        low_n = df["low"].rolling(9).min()
+        high_n = df["high"].rolling(9).max()
+        rsv = (close - low_n) / (high_n - low_n) * 100
+        k = rsv.ewm(alpha=1/3, adjust=False).mean()
+        d = k.ewm(alpha=1/3, adjust=False).mean()
+        j = 3*k - 2*d
+        ax_kdj = axes[row_ptr]
+        ax_kdj.plot(idx, k, label="K")
+        ax_kdj.plot(idx, d, label="D")
+        ax_kdj.plot(idx, j, label="J")
+        ax_kdj.set_ylabel("KDJ")
+        ax_kdj.legend(loc="upper left")
+        row_ptr += 1
 
-    # MACD panel
+    # MACD
     if show_macd:
-        macd = compute_macd(df, fast=12, slow=26, signal=9)
-        aps.append(mpf.make_addplot(macd["HIST"], panel=2, type="bar", alpha=0.5))
-        aps.append(mpf.make_addplot(macd["DIF"], panel=2, width=0.8))
-        aps.append(mpf.make_addplot(macd["DEA"], panel=2, width=0.8))
+        fast_ema = ema(close, 12)
+        slow_ema = ema(close, 26)
+        diff = fast_ema - slow_ema
+        dea = diff.ewm(span=9, adjust=False).mean()
+        hist = diff - dea
+        ax_macd = axes[row_ptr]
+        ax_macd.plot(idx, diff, label="DIFF")
+        ax_macd.plot(idx, dea, label="DEA")
+        ax_macd.bar(idx, hist, width=0.8, alpha=0.5, label="HIST")
+        ax_macd.set_ylabel("MACD")
+        ax_macd.legend(loc="upper left")
+        row_ptr += 1
 
-    # ── 繪圖 & 回傳 PNG（確保關圖：避免記憶體累積）────────────────────────────
-    fig = None
-    try:
-        fig, axlist = mpf.plot(
-            df,
-            type="candle",
-            style="yahoo",
-            addplot=aps,
-            volume=False,               # 如要顯示量能可改 True（會多一個 panel）
-            returnfig=True,             # 取得 fig 才能關掉
-            figscale=1.1,
-            figratio=(16, 9),
-            panel_ratios=(3, 1, 1) if (show_kdj and show_macd) else (3, 1),
-            tight_layout=True,
-            datetime_format="%Y-%m-%d\n%H:%M"
-        )
-        buf = BytesIO()
-        fig.savefig(buf, format="png", dpi=140, bbox_inches="tight")
-        buf.seek(0)
-        return StreamingResponse(buf, media_type="image/png")
-    except Exception as e:
-        raise HTTPException(500, f"plot failed: {e}")
-    finally:
-        if fig is not None:
-            plt.close(fig)
-        else:
-            plt.close("all")
+    # Volume
+    if volume:
+        ax_vol = axes[row_ptr]
+        ax_vol.bar(idx, df["volume"], width=0.8, alpha=0.5)
+        ax_vol.set_ylabel("VOL")
+
+    plt.tight_layout()
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+# ---------------------------
+# FastAPI
+# ---------------------------
+app = FastAPI(title=APP_NAME)
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": APP_NAME, "endpoints": ["/price", "/klines", "/indicators", "/chart"]}
-# ==== Experience logging (SQLite) ============================================
-import os, sqlite3
-from typing import Optional, Literal, List
-from pydantic import BaseModel
-from fastapi import Query
+    return {"ok": True, "name": APP_NAME}
 
-EXPERIENCE_DB_PATH = os.getenv("EXPERIENCE_DB_PATH", "data/experience.db")
-
-def _init_experience_db():
-    os.makedirs(os.path.dirname(EXPERIENCE_DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(EXPERIENCE_DB_PATH, check_same_thread=False)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS experience (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts INTEGER NOT NULL,
-      symbol TEXT NOT NULL,
-      interval TEXT NOT NULL,
-      pattern TEXT NOT NULL,
-      direction TEXT,
-      context TEXT,
-      entry REAL,     -- 4dp
-      confirm REAL,   -- 4dp
-      invalid REAL,   -- 4dp
-      exit REAL,      -- 4dp
-      result TEXT,    -- win/loss/breakeven/n/a
-      chart_url TEXT
-    );
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_exp_ts ON experience(ts DESC);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_exp_pat ON experience(pattern);")
-    conn.commit()
-    conn.close()
-
-def _exp_conn():
-    conn = sqlite3.connect(EXPERIENCE_DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-@app.on_event("startup")
-def _exp_on_startup():
+@app.get("/price")
+def api_price(
+    symbol: str = Query(..., example="XRP/USDT"),
+    source: str = Query("book", pattern="^(book|ticker)$"),
+    precision: int = Query(4, ge=0, le=10),
+):
     try:
-        _init_experience_db()
+        return fetch_price(symbol, source, precision)
     except Exception as e:
-        # 不影響主功能；失敗時只在 logs 告知
-        print("experience db init failed:", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ---- Pydantic models --------------------------------------------------------
-class ExperienceLogIn(BaseModel):
-    ts: Optional[int] = None           # ms；空值則用伺服器 now
-    symbol: str = "XRP/USDT"
-    interval: Literal["5m","15m","30m","1h","4h","1d"] = "15m"
-    pattern: str                       # 形態名稱（依你的《蠟燭圖精解》）
-    direction: Optional[Literal["long","short","neutral"]] = None
-    context: Optional[str] = None      # 摘要說明（依據、書中章節、KDJ/MACD/BB 提示等）
-    entry: Optional[float] = None      # 入場價（四位）
-    confirm: Optional[float] = None    # 確認價（四位）
-    invalid: Optional[float] = None    # 無效化價（四位）
-    exit: Optional[float] = None       # 出場/止損/止盈價（四位）
-    result: Optional[Literal["win","loss","breakeven","n/a"]] = None
-    chart_url: Optional[str] = None
+@app.get("/klines")
+def api_klines(
+    symbol: str = Query(..., example="XRP/USDT"),
+    interval: str = Query("15m", description="5m, 15m, 30m, 1h, 4h, 1d"),
+    limit: int = Query(200, ge=5, le=1000),
+):
+    try:
+        df = fetch_klines(symbol, interval, limit)
+        rows = [
+            {
+                "ts": int(r.ts),
+                "open": r4(r.open),
+                "high": r4(r.high),
+                "low": r4(r.low),
+                "close": r4(r.close),
+                "volume": float(f"{r.volume:.2f}")
+            }
+            for r in df.itertuples(index=False)
+        ]
+        return {
+            "exchange": "binance",
+            "symbol": symbol,
+            "interval": interval,
+            "rows": rows
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-class ExperienceRow(ExperienceLogIn):
-    id: int
+@app.get("/indicators")
+def api_indicators(
+    symbol: str = Query(..., example="XRP/USDT"),
+    interval: str = Query("15m"),
+    limit: int = Query(200, ge=30, le=1000),
+):
+    try:
+        df = fetch_klines(symbol, interval, limit)
+        res = indicators(df)
+        return {"exchange": "binance", "symbol": symbol, "interval": interval, **res}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ---- Endpoints --------------------------------------------------------------
+@app.get("/chart")
+def api_chart(
+    symbol: str = Query(..., example="XRP/USDT"),
+    interval: str = Query("15m"),
+    limit: int = Query(200, ge=30, le=300),
+    sma20: int = Query(20, ge=2, le=200),
+    sma50: int = Query(50, ge=2, le=300),
+    bbands: int = Query(20, ge=5, le=100),
+    show_kdj: bool = Query(False),
+    show_macd: bool = Query(False),
+    volume: bool = Query(True),
+):
+    try:
+        df = fetch_klines(symbol, interval, limit)
+        buf = make_chart(df, symbol, interval, limit, sma20, sma50, bbands, show_kdj, show_macd, volume)
+        return StreamingResponse(buf, media_type="image/png")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------
+# 簡易經驗紀錄（示範）
+# ---------------------------
+class ExperienceIn(BaseModel):
+    symbol: str
+    interval: str
+    pattern: Optional[str] = None
+    outcome: Optional[str] = None  # bullish/bearish/neutral
+    notes: Optional[str] = None
+
+EXPERIENCE_LOG: List[Dict[str, Any]] = []
+
 @app.post("/experience/log")
-def experience_log(item: ExperienceLogIn):
-    # 四位小數統一
-    def _r4f(v): return None if v is None else float(f"{float(v):.4f}")
-    ts = item.ts or int(time.time()*1000)
-    conn = _exp_conn()
-    cur = conn.cursor()
-    cur.execute("""
-      INSERT INTO experience
-      (ts, symbol, interval, pattern, direction, context, entry, confirm, invalid, exit, result, chart_url)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        ts, item.symbol, item.interval, item.pattern, item.direction, item.context,
-        _r4f(item.entry), _r4f(item.confirm), _r4f(item.invalid), _r4f(item.exit),
-        item.result, item.chart_url
-    ))
-    conn.commit()
-    rid = cur.lastrowid
-    conn.close()
-    return {"ok": True, "id": rid}
+def experience_log(payload: ExperienceIn):
+    entry = payload.dict()
+    entry["ts"] = int(datetime.now(tz=ZoneInfo("Asia/Taipei")).timestamp() * 1000)
+    EXPERIENCE_LOG.append(entry)
+    # 只保留最近 500 筆
+    if len(EXPERIENCE_LOG) > 500:
+        del EXPERIENCE_LOG[:-500]
+    return {"ok": True, "saved": entry}
 
 @app.get("/experience/recent")
-def experience_recent(
-    pattern: Optional[str] = None,
-    symbol: Optional[str] = None,
-    interval: Optional[Literal["5m","15m","30m","1h","4h","1d"]] = None,
-    limit: int = Query(50, ge=1, le=500)
-):
-    conn = _exp_conn()
-    q = "SELECT * FROM experience"
-    conds, args = [], []
-    if pattern:
-        conds.append("pattern = ?"); args.append(pattern)
-    if symbol:
-        conds.append("symbol = ?"); args.append(symbol)
-    if interval:
-        conds.append("interval = ?"); args.append(interval)
-    if conds:
-        q += " WHERE " + " AND ".join(conds)
-    q += " ORDER BY ts DESC LIMIT ?"; args.append(limit)
-    rows = [dict(r) for r in conn.execute(q, args).fetchall()]
-    conn.close()
-    return {"rows": rows, "count": len(rows)}
-# ==== end of experience logging =============================================
+def experience_recent(limit: int = Query(20, ge=1, le=200)):
+    return {"items": EXPERIENCE_LOG[-limit:][::-1]}
