@@ -118,62 +118,22 @@ paths:
 
   /chart:
     get:
-      summary: Candlestick chart (PNG)
-      operationId: getChart
-      parameters:
-        - in: query
-          name: symbol
-          required: true
-          schema: { type: string }
-          example: XRP/USDT
-        - in: query
-          name: interval
-          required: true
-          schema:
-            type: string
-            enum: [5m, 15m, 30m, 1h, 4h, 1d]
-          example: 15m
-        - in: query
-          name: limit
-          required: false
-          schema: { type: integer, minimum: 100, maximum: 500, default: 300 }
-          example: 300
-        - in: query
-          name: sma
-          description: 簡單移動平均（單一週期）
-          required: false
-          schema: { type: integer, minimum: 2, maximum: 200, default: 20 }
-          example: 20
-        - in: query
-          name: bbands
-          description: 布林帶週期（K=2 固定）
-          required: false
-          schema: { type: integer, minimum: 5, maximum: 100, default: 20 }
-          example: 20
-        - in: query
-          name: show_kdj
-          required: false
-          schema: { type: boolean, default: true }
-          example: true
-        - in: query
-          name: show_macd
-          required: false
-          schema: { type: boolean, default: true }
-          example: true
-        - in: query
-          name: volume
-          description: 是否顯示成交量
-          required: false
-          schema: { type: boolean, default: true }
-          example: true
+      summary: (停用) 圖表輸出
+      tags: [chart]
+      deprecated: true
       responses:
-        "200":
-          description: PNG image
-          content:
-            image/png:
-              schema:
-                type: string
-                format: binary
+        "501":
+          description: Chart disabled. Use /klines and /indicators.
+
+  /chart/quick:
+    get:
+      summary: (停用) 快速 15m 圖表
+      tags: [chart]
+      deprecated: true
+      responses:
+        "501":
+          description: Chart disabled. Use /klines and /indicators.
+
 
   /experience/log:
     post:

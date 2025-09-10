@@ -252,126 +252,46 @@ def get_indicators(
     }
 
 # -----------------------------------------------------------------------------
-# /chart（穩定版）
-# -----------------------------------------------------------------------------
-@app.get("/chart", summary="K線圖（可含成交量＋指標）", description="回傳 image/png | image/webp | image/jpeg")
-def get_chart(
+# ---- /chart (disabled stub) ----
+from fastapi.responses import JSONResponse
+
+@app.get("/chart", summary="(停用) 圖表輸出", tags=["chart"])
+def get_chart_disabled(
     symbol: str = Query(..., example="XRP/USDT"),
-    interval: str = Query("15m", regex="^(5m|15m|30m|1h|4h|1d)$"),
-    limit: int = Query(200, ge=50, le=500, example=300),
-    sma: int = Query(30, ge=2, le=200, description="簡單移動平均"),
-    bbands: int = Query(20, ge=5, le=100, description="布林通道 N"),
-    sigma: float = Query(2.0, ge=0.5, le=4.0, description="布林 K（標準差倍數）"),
-    show_kdj: bool = Query(True),
-    show_macd: bool = Query(True),
+    interval: str = Query(..., regex="^(5m|15m|30m|1h|4h|1d)$", example="15m"),
+    limit: int = Query(200, ge=50, le=200, example=200),
+    sma20: int = Query(20, ge=2, le=200, description="SMA 週期"),
+    bbands: int = Query(20, ge=5, le=100, description="布林基準週期"),
+    sigma: float = Query(2.0, ge=0.5, le=4.0, description="布林標準差倍數"),
+    show_kdj: bool = Query(False),
+    show_macd: bool = Query(False),
     volume: bool = Query(True),
-    width: int = Query(980, ge=480, le=1920),
+    width: int = Query(980, ge=320, le=1920),
     height: int = Query(480, ge=320, le=1080),
-    dpi: int = Query(110, ge=72, le=200),
+    dpi: int = Query(110, ge=72, le=220),
     tight: bool = Query(True),
-    ext: str = Query("png", regex="^(png|webp|jpg|jpeg)$"),
+    ext: str = Query("png", regex="^(png|webp|jpeg)$"),
 ):
-    rows = fetch_ohlcv(symbol, interval, limit)
-    if not rows:
-        raise HTTPException(404, "No OHLCV data")
+    return JSONResponse(
+        status_code=501,
+        content={
+            "error": "chart_disabled",
+            "message": "圖表輸出暫時停用。請改用 /klines 與 /indicators 取得 K 線與指標數據；GPT 分析不受影響。"
+        },
+    )
 
-    df = pd.DataFrame(rows)
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("Asia/Taipei")
-    df = df.set_index("ts").sort_index()
-
-    fig = plt.figure(figsize=(width / 100, height / 100), dpi=dpi)
-    ax_price = fig.add_subplot(1, 1, 1)
-
-    # 盡量用 K 線；沒有 mplfinance 就退化
-    try:
-        import mplfinance as mpf
-        mdf = df.rename(columns={
-            "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"
-        })
-        addplots = []
-
-        # SMA
-        if sma:
-            addplots.append(mpf.make_addplot(mdf["Close"].rolling(sma).mean(), color="tab:blue"))
-
-        # BBands
-        if bbands:
-            mid = mdf["Close"].rolling(bbands).mean()
-            std = mdf["Close"].rolling(bbands).std(ddof=0)
-            upper = mid + sigma * std
-            lower = mid - sigma * std
-            addplots.append(mpf.make_addplot(upper, color="tab:gray"))
-            addplots.append(mpf.make_addplot(mid, color="tab:orange"))
-            addplots.append(mpf.make_addplot(lower, color="tab:gray"))
-
-        addpanels = 0
-
-        if show_macd:
-            macd_fast = mdf["Close"].ewm(span=12, adjust=False).mean()
-            macd_slow = mdf["Close"].ewm(span=26, adjust=False).mean()
-            macd = macd_fast - macd_slow
-            signal = macd.ewm(span=9, adjust=False).mean()
-            addplots.append(mpf.make_addplot(macd, panel=addpanels+1, color="tab:green"))
-            addplots.append(mpf.make_addplot(signal, panel=addpanels+1, color="tab:red"))
-            addpanels += 1
-
-        if show_kdj:
-            low_n = mdf["Low"].rolling(9).min()
-            high_n = mdf["High"].rolling(9).max()
-            rsv = (mdf["Close"] - low_n) / (high_n - low_n) * 100
-            k = rsv.ewm(com=2).mean()
-            d = k.ewm(com=2).mean()
-            j = 3 * k - 2 * d
-            addplots.append(mpf.make_addplot(k, panel=addpanels+1, color="tab:blue"))
-            addplots.append(mpf.make_addplot(d, panel=addpanels+1, color="tab:orange"))
-            addplots.append(mpf.make_addplot(j, panel=addpanels+1, color="tab:purple"))
-            addpanels += 1
-
-        mpf.plot(
-            mdf,
-            type="candle",
-            ax=ax_price,
-            addplot=addplots if addplots else None,
-            volume=volume,
-            style="yahoo",
-            warn_too_much_data=0,
-        )
-    except Exception:
-        # 無 mplfinance：退化畫法
-        ax_price.plot(df.index, df["close"], linewidth=1.25)
-        if sma:
-            ax_price.plot(df.index, df["close"].rolling(sma).mean(), linewidth=1.0)
-        if bbands:
-            mid = df["close"].rolling(bbands).mean()
-            std = df["close"].rolling(bbands).std(ddof=0)
-            upper = mid + sigma * std
-            lower = mid - sigma * std
-            ax_price.plot(df.index, upper, linewidth=0.9)
-            ax_price.plot(df.index, mid, linewidth=0.9)
-            ax_price.plot(df.index, lower, linewidth=0.9)
-        if volume:
-            ax_v = ax_price.twinx()
-            ax_v.bar(df.index, df["volume"], alpha=0.15, width=0.0008)
-
-    buf = io.BytesIO()
-    out_ext = "jpeg" if ext in ("jpg", "jpeg") else ext
-    fig.savefig(buf, format=out_ext, bbox_inches=("tight" if tight else None))
-    plt.close(fig)
-    return Response(buf.getvalue(), media_type=f"image/{out_ext}")
-
-# -----------------------------------------------------------------------------
-# /chart/quick（超簡版）
-# -----------------------------------------------------------------------------
-@app.get("/chart/quick", summary="快速 K 線圖（預設值）")
-def get_chart_quick(
+@app.get("/chart/quick", summary="(停用) 快速 15m 圖表", tags=["chart"])
+def get_chart_quick_disabled(
     symbol: str = Query(..., example="XRP/USDT"),
     interval: str = Query("15m", regex="^(5m|15m|30m|1h|4h|1d)$"),
 ):
-    return get_chart(
-        symbol=symbol, interval=interval,
-        limit=200, sma=30, bbands=20, sigma=2.0,
-        show_kdj=True, show_macd=True, volume=False,
-        width=980, height=480, dpi=110, tight=True, ext="png",
+    # 仍回 501，避免被誤用
+    return JSONResponse(
+        status_code=501,
+        content={
+            "error": "chart_disabled",
+            "message": "圖表輸出暫時停用。請改用 /klines 與 /indicators。"
+        },
     )
 
 # -----------------------------------------------------------------------------
