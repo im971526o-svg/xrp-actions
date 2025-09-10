@@ -21,10 +21,6 @@ from typing import List, Optional
 import pandas as pd
 import numpy as np
 
-import matplotlib
-matplotlib.use("Agg")  # 關鍵：無頭環境使用 Agg 後端（Render 等雲端必備）
-import matplotlib.pyplot as plt
-
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
