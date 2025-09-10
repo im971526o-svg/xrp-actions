@@ -6,24 +6,27 @@
 #   GET  /price           -> 現價（含本地時間字串）
 #   GET  /klines          -> K 線資料 rows (ts/open/high/low/close/volume)
 #   GET  /indicators      -> 取得最新一根的技術指標（BBands/KDJ/MACD）
-#   GET  /chart           -> 穩定版 K 線圖（可含成交量＋指標）image/png|webp|jpeg
-#   GET  /chart/quick     -> 超簡版 K 線圖（預設參數）
+#   GET  /chart           -> 停用（501），避免依賴圖片
+#   GET  /chart/quick     -> 停用（501）
 #   POST /experience/log  -> 寫入經驗（SQLite）
 #   GET  /experience/recent -> 讀取最近經驗
+#   GET  /auto/status     -> 自動交易開關狀態
+#   POST /auto/enable     -> 開/關自動交易（需 X-AUTO-SECRET）
 # ============================================================================
 
 import io
 import math
 import time
+import os
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List
 
 import pandas as pd
 import numpy as np
 
-from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi import FastAPI, HTTPException, Query, Body, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 
 # 市場資料 (ccxt)
 import ccxt
@@ -33,7 +36,7 @@ from sqlalchemy import Column, Integer, String, Text, DateTime, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 APP_NAME = "XRP Pattern Scanner Actions"
-app = FastAPI(title=APP_NAME, version="0.1.1")
+app = FastAPI(title=APP_NAME, version="0.1.2")
 
 # CORS：預設開放（方便你在不同環境測）
 app.add_middleware(
@@ -46,7 +49,6 @@ app.add_middleware(
 # Exchange 初始化（Binance）
 # -----------------------------------------------------------------------------
 exchange = ccxt.binance({"enableRateLimit": True})
-# 對時（你之前遇到過的 AdjustForTimeDifference 問題，這裡內建打開）
 try:
     exchange.options["adjustForTimeDifference"] = True
 except Exception:
@@ -79,10 +81,6 @@ TF_ALLOW = {"5m", "15m", "30m", "1h", "4h", "1d"}
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
-def tz_taipei_now():
-    # 保持和後端時間設定一致
-    return datetime.now(timezone.utc).astimezone().astimezone()
-
 def to_taipei_ms(ms:int) -> datetime:
     return datetime.fromtimestamp(ms/1000, tz=timezone.utc).astimezone()
 
@@ -90,15 +88,10 @@ def zh_time(dt: datetime) -> str:
     h = dt.hour
     m = dt.minute
     ap = "上午" if h < 12 else "下午"
-    h12 = h % 12
-    if h12 == 0:
-        h12 = 12
+    h12 = h % 12 or 12
     return f"{ap} {h12:02d} 點 {m:02d} 分"
 
 def fetch_ohlcv(symbol: str, interval: str, limit: int) -> List[dict]:
-    """
-    從 Binance 取得 OHLCV，輸出成 list[dict] 格式。
-    """
     if interval not in TF_ALLOW:
         raise HTTPException(400, f"interval must be one of {sorted(TF_ALLOW)}")
     limit = clamp(limit, 50, 500)
@@ -118,11 +111,6 @@ def fetch_ohlcv(symbol: str, interval: str, limit: int) -> List[dict]:
     return rows
 
 def fetch_price(symbol: str, source: str = "ticker") -> float:
-    """
-    取得現價：
-    - source=ticker : 使用 ticker 最後成交價
-    - source=book   : 使用最佳 bid/ask 取中間價
-    """
     try:
         if source == "book":
             ob = exchange.fetch_order_book(symbol, limit=5)
@@ -133,8 +121,9 @@ def fetch_price(symbol: str, source: str = "ticker") -> float:
             return float((best_bid + best_ask) / 2)
         else:
             t = exchange.fetch_ticker(symbol)
-            # 有些交易所有 last / close
             px = t.get("last") or t.get("close")
+            if px is None:
+                raise Exception("ticker has no last/close")
             return float(px)
     except Exception as e:
         raise HTTPException(502, f"fetch_price error: {e}")
@@ -193,10 +182,11 @@ def get_indicators(
     if len(rows) < max(bbands, 26) + 5:
         raise HTTPException(400, "not enough data for indicators")
 
-    df = pd.DataFrame(rows).set_index(pd.to_datetime([r["ts"] for r in rows], unit="ms", utc=True))
-    close = pd.Series([r["close"] for r in rows], index=df.index)
-    high = pd.Series([r["high"] for r in rows], index=df.index)
-    low  = pd.Series([r["low"]  for r in rows], index=df.index)
+    df = pd.DataFrame(rows)
+    df.index = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    close = df["close"]
+    high  = df["high"]
+    low   = df["low"]
 
     # BBands
     mid = close.rolling(bbands).mean()
@@ -204,10 +194,11 @@ def get_indicators(
     upper = mid + sigma * std
     lower = mid - sigma * std
 
-    # KDJ (9,3,3)
+    # KDJ (9,3,3) with safe denominator
     low_n  = low.rolling(9).min()
     high_n = high.rolling(9).max()
-    rsv = (close - low_n) / (high_n - low_n) * 100
+    denom = (high_n - low_n).replace(0, np.nan)
+    rsv = ((close - low_n) / denom * 100).fillna(0.0)
     k = rsv.ewm(com=2).mean()
     d = k.ewm(com=2).mean()
     j = 3*k - 2*d
@@ -248,9 +239,8 @@ def get_indicators(
     }
 
 # -----------------------------------------------------------------------------
-# ---- /chart (disabled stub) ----
-from fastapi.responses import JSONResponse
-
+# /chart 停用（返回 501）
+# -----------------------------------------------------------------------------
 @app.get("/chart", summary="(停用) 圖表輸出", tags=["chart"])
 def get_chart_disabled(
     symbol: str = Query(..., example="XRP/USDT"),
@@ -281,7 +271,6 @@ def get_chart_quick_disabled(
     symbol: str = Query(..., example="XRP/USDT"),
     interval: str = Query("15m", regex="^(5m|15m|30m|1h|4h|1d)$"),
 ):
-    # 仍回 501，避免被誤用
     return JSONResponse(
         status_code=501,
         content={
@@ -305,7 +294,6 @@ def post_experience_log(
     if not required.issubset(payload.keys()):
         raise HTTPException(400, f"missing fields: {required - set(payload.keys())}")
 
-    # 基本檢查
     interval = payload["interval"]
     if interval not in TF_ALLOW:
         raise HTTPException(400, f"interval must be in {sorted(TF_ALLOW)}")
@@ -353,10 +341,10 @@ def get_experience_recent(limit: int = Query(20, ge=1, le=100)):
         return {"items": items}
     finally:
         db.close()
-# --- Auto Trading Toggle (minimal) ---
-import os
-from fastapi import Header
 
+# -----------------------------------------------------------------------------
+# Auto Trading Toggle (minimal)
+# -----------------------------------------------------------------------------
 AUTO_SECRET = os.getenv("AUTO_SECRET", "")  # 在 Render 環境變數設定同一個值
 _auto_enabled = {"enabled": False}
 
@@ -372,10 +360,8 @@ def auto_enable(enabled: bool, x_auto_secret: str = Header(default="")):
     return {"ok": True, "enabled": _auto_enabled["enabled"]}
 
 # -----------------------------------------------------------------------------
-# main
+# main（本地測試用）
 # -----------------------------------------------------------------------------
-# Render 通常會用 uvicorn 指令啟動，不一定要 __main__。
-# 保留以下以便本地測試：
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000)
