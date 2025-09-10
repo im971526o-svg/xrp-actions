@@ -357,6 +357,23 @@ def get_experience_recent(limit: int = Query(20, ge=1, le=100)):
         return {"items": items}
     finally:
         db.close()
+# --- Auto Trading Toggle (minimal) ---
+import os
+from fastapi import Header
+
+AUTO_SECRET = os.getenv("AUTO_SECRET", "")  # 在 Render 環境變數設定同一個值
+_auto_enabled = {"enabled": False}
+
+@app.get("/auto/status", summary="Auto-trading status")
+def auto_status():
+    return {"enabled": _auto_enabled["enabled"]}
+
+@app.post("/auto/enable", summary="Enable/disable auto-trading")
+def auto_enable(enabled: bool, x_auto_secret: str = Header(default="")):
+    if not AUTO_SECRET or x_auto_secret != AUTO_SECRET:
+        return {"ok": False, "error": "unauthorized"}
+    _auto_enabled["enabled"] = bool(enabled)
+    return {"ok": True, "enabled": _auto_enabled["enabled"]}
 
 # -----------------------------------------------------------------------------
 # main
