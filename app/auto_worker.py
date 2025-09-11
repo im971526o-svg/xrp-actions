@@ -5,20 +5,21 @@ import math
 import json
 import ccxt
 import pandas as pd
-import numpy as np
 from datetime import datetime, timezone, timedelta
 
 # ---------- 環境變數 ----------
-SYMBOLS = os.getenv("SYMBOLS", "XRP/USDT").split(",")
-SYMBOLS = [s.strip() for s in SYMBOLS if s.strip()]
+# 支援 SYMBOLS 或舊的單一 SYMBOL
+_symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL", "XRP/USDT")
+SYMBOLS = [s.strip() for s in _symbols_env.split(",") if s.strip()]
+
 INTERVAL  = os.getenv("INTERVAL", "15m")
-LOOP_SEC  = int(os.getenv("LOOP_SEC", "900"))        # 15 分鐘
+LOOP_SEC  = int(os.getenv("LOOP_SEC", "900"))        # 15 分鐘輪巡
 DRY_RUN   = os.getenv("DRY_RUN", "true").lower() == "true"
 TESTNET   = os.getenv("TESTNET", "true").lower() == "true"
-BASE_URL  = os.getenv("BASE_URL", "")                # 可留空
 EXCHANGE  = os.getenv("EXCHANGE", "binance")
+EXCHANGE_LOWER = EXCHANGE.lower()
 
-# 交易大小（以 quote 幣，例如 USDT 金額）；實單前務必調整成符合交易所最小單位
+# 單筆以 quote 幣的金額（USDT）下單；正式上線前務必調整成交易所允許的最小單位
 QUOTE_SIZE = float(os.getenv("TRADE_SIZE_USDT", "10"))
 
 BINANCE_KEY    = os.getenv("BINANCE_KEY", "")
@@ -29,42 +30,29 @@ TZ = timezone(timedelta(hours=8))  # Asia/Taipei for logs
 def log(msg, **kw):
     ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", (kw if kw else ""))
-    
+
 # ---------- 交易所連線 ----------
 def build_exchange():
-    if EXCHANGE.lower() == "binance":
-        params = {
-            "enableRateLimit": True,
-            "options": {
-                "defaultType": "spot",
-                "adjustForTimeDifference": True
-            }
-        }
-        if BINANCE_KEY and BINANCE_SECRET:
-            params["apiKey"] = BINANCE_KEY
-            params["secret"] = BINANCE_SECRET
-        ex = ccxt.binance(params)
-
-        # 測試網處理
-        if TESTNET:
-            ex.set_sandbox_mode(True)
-            # 對 ccxt binance sandbox，使用 testnet 網域
-            ex.urls["api"] = {
-                "public": "https://testnet.binance.vision/api",
-                "private": "https://testnet.binance.vision/api",
-            }
-        if BASE_URL:
-            # 若你想強制覆寫 API 網域（通常不用）
-            ex.urls["api"]["public"] = BASE_URL
-            ex.urls["api"]["private"] = BASE_URL
-
-        return ex
-    else:
+    if EXCHANGE_LOWER != "binance":
         raise RuntimeError(f"Unsupported EXCHANGE: {EXCHANGE}")
+
+    ex = ccxt.binance({
+        "apiKey": BINANCE_KEY,
+        "secret": BINANCE_SECRET,
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "spot",
+            "adjustForTimeDifference": True,
+        },
+    })
+
+    # 關鍵：僅用 ccxt 的 sandbox 切測試網；不要再覆寫任何 ex.urls 或 BASE_URL
+    ex.set_sandbox_mode(TESTNET)
+    return ex
 
 # ---------- 指標 ----------
 def indicators(df: pd.DataFrame):
-    # df 欄: open high low close volume ts (毫秒)
+    # 需要欄位: open high low close volume ts(毫秒)
     close = df["close"].astype(float)
     high  = df["high"].astype(float)
     low   = df["low"].astype(float)
@@ -92,77 +80,65 @@ def indicators(df: pd.DataFrame):
     dea = dif.ewm(span=9, adjust=False).mean()
     hist = dif - dea
 
-    out = pd.DataFrame({
-        "sma20": sma,
-        "bb_upper": upper,
-        "bb_lower": lower,
-        "k": k,
-        "d": d,
-        "j": j,
-        "macd_dif": dif,
-        "macd_dea": dea,
-        "macd_hist": hist
-    }, index=df.index)
-
-    return out
+    return pd.DataFrame(
+        {
+            "sma20": sma,
+            "bb_upper": upper,
+            "bb_lower": lower,
+            "k": k, "d": d, "j": j,
+            "macd_dif": dif, "macd_dea": dea, "macd_hist": hist,
+        },
+        index=df.index,
+    )
 
 # ---------- 取 K 線 ----------
 def fetch_klines(ex, symbol: str, timeframe: str, limit: int = 200):
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-    return df
+    return pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
 
-# ---------- 非常保守策略（範例） ----------
-# 僅示意：MACD 由負翻正 & K > D & 收在 SMA20 上 → "buy"
-#       MACD 由正翻負 & K < D & 收在 SMA20 下 → "sell"
+# ---------- 很保守的示範訊號 ----------
+# MACD 由負翻正 & K > D & 收在 SMA20 上 → buy
+# MACD 由正翻負 & K < D & 收在 SMA20 下 → sell
 def simple_signal(df: pd.DataFrame, ind: pd.DataFrame):
     if len(df) < 30:
         return None, {}
 
     c  = float(df["close"].iloc[-1])
-    c1 = float(df["close"].iloc[-2])
-
     sma  = float(ind["sma20"].iloc[-1])
     dif0 = float(ind["macd_dif"].iloc[-1])
     dea0 = float(ind["macd_dea"].iloc[-1])
     dif1 = float(ind["macd_dif"].iloc[-2])
     dea1 = float(ind["macd_dea"].iloc[-2])
+    k0 = float(ind["k"].iloc[-1])
+    d0 = float(ind["d"].iloc[-1])
 
-    k0 = float(ind["k"].iloc[-1]); d0 = float(ind["d"].iloc[-1])
+    cross_up   = (dif1 <= dea1) and (dif0 >  dea0)
+    cross_down = (dif1 >= dea1) and (dif0 <  dea0)
 
-    # 金叉由下往上
-    macd_cross_up   = (dif1 <= dea1) and (dif0 > dea0)
-    macd_cross_down = (dif1 >= dea1) and (dif0 < dea0)
-
-    if macd_cross_up and (k0 > d0) and (c > sma):
-        return "buy", {"close": c, "sma20": sma, "k": k0, "d": d0, "dif": dif0, "dea": dea0}
-    if macd_cross_down and (k0 < d0) and (c < sma):
+    if cross_up and (k0 > d0) and (c > sma):
+        return "buy",  {"close": c, "sma20": sma, "k": k0, "d": d0, "dif": dif0, "dea": dea0}
+    if cross_down and (k0 < d0) and (c < sma):
         return "sell", {"close": c, "sma20": sma, "k": k0, "d": d0, "dif": dif0, "dea": dea0}
     return None, {}
 
-# ---------- 下單（僅示意；正式前請務必驗證最小單位/精度） ----------
+# ---------- 下單（示範；正式上線前請驗證最小單位/精度） ----------
 def place_order(ex, symbol: str, side: str, quote_amount: float):
-    # 以 quote 金額換算數量（市價單）
     ticker = ex.fetch_ticker(symbol)
     price = float(ticker["last"] or ticker["close"])
     amount = quote_amount / price
-    # 取精度
-    markets = ex.load_markets()
-    m = markets[symbol]
-    precision_amount = m["precision"].get("amount", None)
-    if precision_amount is not None:
-        step = 10 ** (-precision_amount)
-        amount = math.floor(amount * step) / step
 
-    log(f"PLACE ORDER (demo) {side} {symbol} amount={amount:.6f} (≈{quote_amount} quote)")
+    # 依精度把數量往下切
+    m = ex.load_markets()[symbol]
+    prec_amt = m["precision"].get("amount")
+    if prec_amt is not None:
+        step = 10 ** (-prec_amt)
+        amount = int(amount / step) * step
+
+    log(f"PLACE ORDER (demo) {side} {symbol} amount={amount:.8f} (≈{quote_amount} quote)")
     if DRY_RUN:
         return {"dry_run": True, "side": side, "symbol": symbol, "amount": amount, "price": price}
 
-    # 市價單
-    if side == "buy":
-        return ex.create_market_buy_order(symbol, amount)
-    else:
-        return ex.create_market_sell_order(symbol, amount)
+    return ex.create_market_buy_order(symbol, amount) if side == "buy" else ex.create_market_sell_order(symbol, amount)
 
 def loop():
     ex = build_exchange()
