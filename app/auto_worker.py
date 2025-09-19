@@ -7,13 +7,36 @@ import ccxt
 import pandas as pd
 from datetime import datetime, timezone, timedelta
 
+# ---- 解析時間字串成秒數（支援 1m/30s/0.5h/數字秒） ----
+def _parse_seconds(text: str) -> int:
+    if text is None:
+        return 900
+    t = str(text).strip().lower()
+    try:
+        if t.endswith("ms"):  # 毫秒
+            return max(1, int(float(t[:-2]) / 1000))
+        if t.endswith("s"):
+            return int(float(t[:-1]))
+        if t.endswith("m"):
+            return int(float(t[:-1]) * 60)
+        if t.endswith("h"):
+            return int(float(t[:-1]) * 3600)
+        return int(float(t))
+    except Exception:
+        return 900  # 預設 15 分鐘
+
 # ---------- 環境變數 ----------
 # 支援 SYMBOLS 或舊的單一 SYMBOL
 _symbols_env = os.getenv("SYMBOLS") or os.getenv("SYMBOL", "XRP/USDT")
 SYMBOLS = [s.strip() for s in _symbols_env.split(",") if s.strip()]
 
-INTERVAL  = os.getenv("INTERVAL", "15m")
-LOOP_SEC  = int(os.getenv("LOOP_SEC", "900"))        # 15 分鐘輪巡
+INTERVAL = os.getenv("INTERVAL", "15m")
+INTERVAL_SEC = _parse_seconds(INTERVAL)
+
+# 這裡是關鍵：優先讀 LOOP_SLEEP_SEC，其次相容舊變數 LOOP_SEC；都沒設就落回 INTERVAL 秒數
+_sleep_env = os.getenv("LOOP_SLEEP_SEC") or os.getenv("LOOP_SEC")
+LOOP_SEC = _parse_seconds(_sleep_env) if _sleep_env else INTERVAL_SEC
+
 DRY_RUN   = os.getenv("DRY_RUN", "true").lower() == "true"
 TESTNET   = os.getenv("TESTNET", "true").lower() == "true"
 EXCHANGE  = os.getenv("EXCHANGE", "binance")
@@ -99,7 +122,6 @@ def fetch_klines(ex, symbol: str, timeframe: str, limit: int = 200):
 # ---------- 很保守的示範訊號 ----------
 # MACD 由負翻正 & K > D & 收在 SMA20 上 → buy
 # MACD 由正翻負 & K < D & 收在 SMA20 下 → sell
-
 def simple_signal(df: pd.DataFrame, ind: pd.DataFrame):
     """
     Return (side, conf, info)
@@ -221,5 +243,6 @@ def loop():
         except Exception as e:
             log(f"loop error: {repr(e)}")
             time.sleep(10)
+
 if __name__ == "__main__":
     loop()
