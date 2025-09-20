@@ -1,10 +1,11 @@
-# app/auto_worker.py
+# app/auto_worker.py  (patched)
 import os
 import time
 import math
 import json
 import ccxt
 import pandas as pd
+import urllib.request, urllib.parse
 from datetime import datetime, timezone, timedelta
 
 # ---- 解析時間字串成秒數（支援 1m/30s/0.5h/數字秒） ----
@@ -33,7 +34,7 @@ SYMBOLS = [s.strip() for s in _symbols_env.split(",") if s.strip()]
 INTERVAL = os.getenv("INTERVAL", "15m")
 INTERVAL_SEC = _parse_seconds(INTERVAL)
 
-# 這裡是關鍵：優先讀 LOOP_SLEEP_SEC，其次相容舊變數 LOOP_SEC；都沒設就落回 INTERVAL 秒數
+# 優先讀 LOOP_SLEEP_SEC，其次相容舊變數 LOOP_SEC；都沒設就落回 INTERVAL 秒數
 _sleep_env = os.getenv("LOOP_SLEEP_SEC") or os.getenv("LOOP_SEC")
 LOOP_SEC = _parse_seconds(_sleep_env) if _sleep_env else INTERVAL_SEC
 
@@ -48,11 +49,39 @@ QUOTE_SIZE = float(os.getenv("TRADE_SIZE_USDT", "10"))
 BINANCE_KEY    = os.getenv("BINANCE_KEY", "")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET", "")
 
+# 勝率門檻：環境變數 MIN_WINRATE 優先；否則讀設定檔；預設 0.6
+MIN_WINRATE_ENV = os.getenv("MIN_WINRATE")
+
+# 設定檔
+SETTINGS_PATH = os.getenv("RUNTIME_SETTINGS_PATH", "runtime_settings.json")
+
+# LINE Notify
+LINE_TOKEN = os.getenv("LINE_NOTIFY_TOKEN", "")
+LINE_NOTIFY_ON = os.getenv("LINE_NOTIFY_ON", "orders").lower()  # orders | all | off
+
 TZ = timezone(timedelta(hours=8))  # Asia/Taipei for logs
 
 def log(msg, **kw):
     ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", (kw if kw else ""))
+
+def notify(msg: str):
+    if not LINE_TOKEN or LINE_NOTIFY_ON == "off":
+        return
+    data = urllib.parse.urlencode({"message": msg}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://notify-api.line.me/api/notify",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {LINE_TOKEN}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            _ = resp.read()
+    except Exception as e:
+        log(f"LINE notify error: {repr(e)}")
 
 # ---------- 交易所連線 ----------
 def build_exchange():
@@ -69,7 +98,7 @@ def build_exchange():
         },
     })
 
-    # 關鍵：僅用 ccxt 的 sandbox 切測試網；不要再覆寫任何 ex.urls 或 BASE_URL
+    # 測試網開關（ccxt sandbox）
     ex.set_sandbox_mode(TESTNET)
     return ex
 
@@ -119,6 +148,31 @@ def fetch_klines(ex, symbol: str, timeframe: str, limit: int = 200):
     ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     return pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
 
+# ---------- 設定讀取 ----------
+def _load_min_winrate(default_val=0.6):
+    try:
+        if MIN_WINRATE_ENV is not None:
+            return float(MIN_WINRATE_ENV)
+        if os.path.exists(SETTINGS_PATH):
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return float(d.get("min_winrate", default_val))
+    except Exception:
+        pass
+    return default_val
+
+def _load_trade_mode(default_val="both"):
+    try:
+        if os.path.exists(SETTINGS_PATH):
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            mode = str(d.get("trade_mode", default_val)).lower()
+            if mode in ("both","long_only","short_only"):
+                return mode
+    except Exception:
+        pass
+    return default_val
+
 # ---------- 很保守的示範訊號 ----------
 # MACD 由負翻正 & K > D & 收在 SMA20 上 → buy
 # MACD 由正翻負 & K < D & 收在 SMA20 下 → sell
@@ -142,13 +196,13 @@ def simple_signal(df: pd.DataFrame, ind: pd.DataFrame):
     d0 = float(ind["d"].iloc[-1])
 
     bull = {
-        "cross_up":   (dif1 <= dea1) and (dif0 >  dea0),
-        "k_gt_d":     (k0 > d0),
+        "cross_up":     (dif1 <= dea1) and (dif0 >  dea0),
+        "k_gt_d":       (k0 > d0),
         "close_gt_sma": (c > sma),
     }
     bear = {
-        "cross_down": (dif1 >= dea1) and (dif0 <  dea0),
-        "k_lt_d":     (k0 < d0),
+        "cross_down":   (dif1 >= dea1) and (dif0 <  dea0),
+        "k_lt_d":       (k0 < d0),
         "close_lt_sma": (c < sma),
     }
     bull_score = sum(1 for v in bull.values() if v)
@@ -186,25 +240,13 @@ def place_order(ex, symbol: str, side: str, quote_amount: float):
 def loop():
     ex = build_exchange()
     log(f"Worker started | EXCHANGE={EXCHANGE} TESTNET={TESTNET} INTERVAL={INTERVAL} DRY_RUN={DRY_RUN} SYMBOLS={SYMBOLS}")
-    settings_path = os.getenv("RUNTIME_SETTINGS_PATH", "runtime_settings.json")
-
-    def load_settings():
-        try:
-            with open(settings_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-        trade_mode = str(data.get("trade_mode", "both")).lower()
-        min_winrate = float(data.get("min_winrate", 0.7))
-        if trade_mode not in ("both", "long_only", "short_only"):
-            trade_mode = "both"
-        if min_winrate < 0.0: min_winrate = 0.0
-        if min_winrate > 1.0: min_winrate = 1.0
-        return trade_mode, min_winrate
+    notify(f"Worker started | INTERVAL={INTERVAL} DRY_RUN={DRY_RUN} LOOP_SEC={LOOP_SEC}")
 
     while True:
         try:
-            trade_mode, min_wr = load_settings()
+            trade_mode = _load_trade_mode("both")
+            min_wr = _load_min_winrate(0.6)
+
             for symbol in SYMBOLS:
                 try:
                     df = fetch_klines(ex, symbol, INTERVAL, limit=200)
@@ -215,6 +257,8 @@ def loop():
 
                     if not side:
                         log(f"[{symbol}] no-signal at {t_local} | close={float(df['close'].iloc[-1]):.6f}")
+                        if LINE_NOTIFY_ON == "all":
+                            notify(f"【{symbol}】NO SIGNAL {t_local} (interval={INTERVAL})")
                         continue
 
                     # trade mode gating
@@ -233,15 +277,22 @@ def loop():
                     log(f"[{symbol}] EXECUTE SIGNAL={side} conf={conf:.2f} at {t_local}", **ctx)
                     res = place_order(ex, symbol, side, QUOTE_SIZE)
                     log(f"[{symbol}] RESULT: {json.dumps(res, ensure_ascii=False)}")
+                    try:
+                        notify(f"【{symbol}】{side.upper()} {t_local} conf={conf:.2f}\nsize={QUOTE_SIZE} USDT\ninterval={INTERVAL}")
+                    except Exception:
+                        pass
                 except Exception as e:
                     log(f"[{symbol}] error: {repr(e)}")
+                    notify(f"[{symbol}] error: {repr(e)}")
             log(f"sleep {LOOP_SEC}s ...")
             time.sleep(LOOP_SEC)
         except KeyboardInterrupt:
             log("worker stopped by KeyboardInterrupt")
+            notify("Worker stopped by KeyboardInterrupt")
             break
         except Exception as e:
             log(f"loop error: {repr(e)}")
+            notify(f"Worker loop error: {repr(e)}")
             time.sleep(10)
 
 if __name__ == "__main__":
